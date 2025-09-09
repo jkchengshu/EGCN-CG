@@ -1,0 +1,137 @@
+from gurobipy import *
+import time
+import math
+import numpy as np
+import random
+from MT_para_real import *
+
+st = time.time()
+
+
+
+m = Model()
+# m.setParam("MIPGap", 0.24)
+# m.setParam("MIPGap", 0.20)
+m.setParam("MIPGap", 0)
+# m.setParam("TimeLimit", 300)
+# m.setParam("Heuristics", 0)
+m.setParam("OutputFlag", 1)
+alpha = m.addVars(S_num, N_num, lb=0, ub=0, vtype=GRB.CONTINUOUS)
+beta = m.addVars(S_num, N_num, T_num, lb=0, ub=0, vtype=GRB.CONTINUOUS)
+gamma = m.addVars(S_num, T_num, lb=0, vtype=GRB.BINARY)
+miu = m.addVars(S_num, T_num, lb=0, vtype=GRB.INTEGER)
+tau = m.addVars(S_num, T_num, T_num, lb=0, vtype=GRB.BINARY)
+theta = m.addVars(N_num, T_num, lb=0, vtype=GRB.CONTINUOUS)
+rho = m.addVars(N_num, T_num, lb=0, vtype=GRB.CONTINUOUS)
+
+for s in S:
+    for t in T:
+        gamma[s, t] = m.addVar(lb=0, ub=1, vtype=GRB.BINARY)
+        miu[s, t] = m.addVar(lb=0, vtype=GRB.INTEGER)
+        for n in N:
+            beta[s, n, t] = m.addVar(lb=0, vtype=GRB.CONTINUOUS)
+        for t1 in range(t):
+            tau[s, t, t1] = m.addVar(lb=0, ub=0, vtype=GRB.BINARY)
+        for t1 in range(t, T_num):
+            tau[s, t, t1] = m.addVar(lb=0, ub=1, vtype=GRB.BINARY)
+    for n in N:
+        alpha[s, n] = m.addVar(lb=0, ub=k_s_n[s, n], vtype=GRB.CONTINUOUS)
+for n in N:
+    for t in T:
+        theta[n, t] = m.addVar(lb=0, ub=q_n[n], vtype=GRB.CONTINUOUS)
+        rho[n, t] = m.addVar(lb=0, ub=q_n[n], vtype=GRB.CONTINUOUS)
+objective = quicksum(
+    quicksum(c_s_n_coal[s, n] * alpha[s, n] for n in N) + quicksum(c_s_ship[s] * gamma[s, t] for t in T) for s in
+    S)
+m.setObjective(objective, GRB.MINIMIZE)
+# 2
+for s in S:
+    for n in N:
+        m.addConstr(alpha[s, n] <= k_s_n[s, n])
+# 3
+for s in S:
+    for n in N:
+        m.addConstr(alpha[s, n] >= quicksum(beta[s, n, t] for t in T))
+# 4
+for s in S:
+    for t in T:
+        m.addConstr(quicksum(beta[s, n, t] for n in N) <= v * gamma[s, t])
+# 5
+for n in N:
+    m.addConstr(theta[n, 0] == l_n[n])
+# 6
+for n in N:
+    for t in range(T_num - 1):
+        m.addConstr(theta[n, t + 1] == theta[n, t] + quicksum(beta[s, n, t] for s in S) - rho[n, t])
+# 7
+for t in T:
+    m.addConstr(quicksum(rho[n, t] * p_n[n] for n in N) == d_t[t])
+# 8
+for t in T:
+    for n in N:
+        m.addConstr(theta[n, t] >= h_n[n])
+        m.addConstr(theta[n, t] <= q_n[n])
+# 9
+for s in S:
+    for  t in T:
+        m.addConstr(u * (miu[s, t] - 1) <= quicksum(beta[s, n, t] for n in N))
+        m.addConstr(u * miu[s, t] >= quicksum(beta[s, n, t] for n in N))
+# 10
+for s in S:
+    for t in T:
+        m.addConstr(tau[s, t, t] == gamma[s, t])
+# 11
+for s in S:
+    for t in T:
+        m.addConstr(quicksum(tau[s, t, t1] for t1 in T) >= miu[s, t])
+# 12
+for t in T:
+    for t1 in range(t, T_num):
+        for s in S:
+            m.addConstr(t1 * tau[s, t, t1] <= (t + miu[s, t] - 1) * gamma[s, t])
+# 13
+for t1 in T:
+    m.addConstr(quicksum(tau[s, t, t1] for s in S for t in T) <= b)
+m.optimize()
+
+print(f"结果:{m.objVal}")
+for s in S:
+    for n in N:
+        if alpha[s, n].X > 0:
+            print(f"从供应商{s}购买的{n}种类煤炭{alpha[s, n].X}吨,花费成本{alpha[s, n].X * c_s_n_coal[s, n]}")
+            if n == best_n[s]:
+                print(f"买的自己最好的,{alpha[s, best_n[s]].X / sum(alpha[s, n].X for n in N)}")
+            if alpha[s, n].X >= 0.96 * k_s_n[s, n]:
+                print("全买完了")
+#     if sum(gamma[s, t].x for t in T) >= 1:
+#         print(
+#             f"从供应商{s} 共出发{sum(gamma[s, t].x for t in T)}次运煤船舶，花费成本为{sum(gamma[s, t].x for t in T) * c_s_ship[s]}")
+for s in S:
+    for t in T:
+        for n in N:
+            if gamma[s, t].X > 0.1 and beta[s, n, t].X > 0:
+                print(f"在时刻{t} 从供应商{s}出发的煤炭船舶 装载{n}种类煤炭{beta[s, n, t].X}吨")
+# for t in T:
+#     print(f"1种类煤炭，{t}时刻存优良为{theta[1,t].X}")
+# for s in S:
+#     for t in T:
+#         for t1 in T:
+#             if tau[s, t, t1].X > 0.1:
+#                 print(f"从供应商{s}出发，并且在{t}时刻到达的船舶，在{t1}时刻占用泊位")
+# for n in N:
+#     for t in T:
+#         print(f"在时刻{t}，{n}种类煤炭库存量为{theta[n,t].x}")
+# for t in T:
+#     for s in S:
+#         if sum(beta[s, n, t].X for n in N) > 0.1:
+#             print("在时刻", t, "供应商", s, "供应了总重量",
+#                   quicksum(beta[s, n, t].X for n in N), "热值为",
+#                   quicksum(beta[s, n, t].X * p_n[n] for n in N))
+# print(f"OP原问题operatime: {time.time() - st}")
+total_demand = sum(d_t[t] for t in T)
+for n in N:
+    print(f"{(sum(alpha[s, n].X for s in S) )} ")
+print()
+for s in S:
+    print(f"{(sum(alpha[s, n].X * c_s_n_coal[s,n] for n in N) )}")
+print(f"{m.objVal}      {time.time() - st}")
