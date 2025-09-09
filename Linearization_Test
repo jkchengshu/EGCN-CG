@@ -6,10 +6,6 @@ import random
 from MT_para_real import *
 
 st = time.time()
-# rnd = np.random
-# rnd.seed(20)
-# rand = random
-# rand.seed(20)
 
 
 m = Model()
