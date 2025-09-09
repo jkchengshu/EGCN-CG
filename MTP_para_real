@@ -1,0 +1,60 @@
+import math
+import numpy as np
+import random
+
+r = 203257
+
+rnd = np.random
+rnd.seed(r)
+rand = random
+rand.seed(r)
+ten_k = 10000
+lack = 9999
+M = 9999
+S_num_all = 6  # Number of suppliers
+T_num_all = 72  # Number of time periods
+N_num_all = 4  # Number of coal types
+v = 7.5 * ten_k
+S_num = 6  # 供应商数目
+T_num = 71  # 时间区间数目
+N_num = 4  # 煤炭种类数目
+F_num = 20  # 长期订购合同
+S = range(S_num)
+T = range(T_num)
+N = range(N_num)
+F = range(F_num)
+b_t = np.zeros(T_num)
+
+for t in T:
+    b_t[t] = rnd.randint(2, 5)
+cycle_f = np.zeros(F_num)
+for f in F:
+    cycle_f[f] = rnd.randint(20, 30)
+
+for f in range(F_num):
+    coal_type = rnd.randint(0, N_num - 1)
+    cycle = int(cycle_f[f])
+
+c_s_n_coal_real = np.array([
+
+])
+
+
+l_n = np.ones(N_num_all) * ten_k
+h_n = np.ones(N_num_all) * ten_k
+h_n[0] = 28000
+h_n[1] = 50000
+h_n[2] = 35000
+h_n[3] = 10000
+for n in N:
+    h_n[n] = h_n[n] * 0.9
+q_n = 12 * ten_k
+q_n_sum = sum(q_n[n] for n in range(N_num_all))
+
+
+"""
+The code is incomplete because the partner power plant requested we reduce data disclosure, 
+citing confidential plant information. 
+We must comply with the agreement and regret that we cannot provide the remaining key parameters.
+
+"""
