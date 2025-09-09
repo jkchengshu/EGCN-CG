@@ -3,7 +3,7 @@ EGCN+CG
 # EGCN + Softmax 架构详解
 
 
-### **完整的模型流程**
+完整的模型流程
 ```
 输入列特征 → EGCN编码器 → 节点嵌入 → Softmax分类器 → 冗余性概率
     ↓           ↓           ↓           ↓             ↓
@@ -11,20 +11,20 @@ EGCN+CG
  (N, F)      GCN+GRU     (N, H)      (N, 2)     (N, 2)
 ```
 
-## 🔧 **当前实现的架构**
+🔧 当前实现的架构
 
-### **1. EGCN编码器部分**
+1. EGCN编码器部分
 ```python
 # 在 egcn_trainer.py 中
 self.model = EGCN(args, activation=F.relu, device=self.device)
 ```
 
-**EGCN的功能：**
+EGCN的功能：
 - ✅ 多关系图卷积（煤炭、时间、船只关系）
 - ✅ GRU动态权重更新
 - ✅ 生成节点嵌入表示
 
-### **2. Softmax分类器部分**
+2. Softmax分类器部分
 ```python
 # 在 egcn_trainer.py 第128-133行
 self.classifier = nn.Sequential(
@@ -35,12 +35,12 @@ self.classifier = nn.Sequential(
 ).to(self.device)
 ```
 
-**Softmax分类器的功能：**
+Softmax分类器的功能：
 - ✅ 将EGCN的节点嵌入映射到2维logits
 - ✅ 通过Softmax得到概率分布
 - ✅ 输出冗余性预测
 
-### **3. 前向传播流程**
+3. 前向传播流程
 ```python
 # 在训练和推理中的完整流程
 def forward_pass(self, features, adj_matrices):
@@ -55,9 +55,8 @@ def forward_pass(self, features, adj_matrices):
     return predictions, probabilities
 ```
 
-## 📊 **输出解释**
-
-### **Softmax输出格式**
+ 📊 输出解释
+Softmax输出格式
 ```python
 # 对于每个列，Softmax输出2个概率：
 probabilities = [
@@ -75,7 +74,7 @@ probabilities = [
 ]
 ```
 
-### **决策逻辑**
+决策逻辑
 ```python
 # 基于概率进行决策
 for i, prob in enumerate(probabilities):
@@ -90,9 +89,8 @@ for i, prob in enumerate(probabilities):
     print(f"列{i}: 冗余概率={redundant_prob:.3f}, 决策={decision}")
 ```
 
-## 🎯 **在CG算法中的应用**
-
-### **集成到CG算法中**
+🎯 在CG算法中的应用
+ 集成到CG算法中
 ```python
 # 在 CG_x_sn_rule_with_EGCN.py 中的应用
 def egcn_redundancy_check(column_features):
@@ -132,9 +130,9 @@ for supplier in suppliers:
         add_column_to_master_problem(new_column_features)
 ```
 
-## 🔧 **训练过程中的Softmax**
+🔧 训练过程中的Softmax
 
-### **损失函数**
+损失函数
 ```python
 # 使用交叉熵损失训练Softmax分类器
 def train_epoch(self, train_loader):
@@ -153,7 +151,7 @@ def train_epoch(self, train_loader):
         self.optimizer.step()
 ```
 
-### **评估指标**
+评估指标
 ```python
 # 评估时计算各种指标
 def evaluate(self, test_loader):
@@ -183,9 +181,9 @@ def evaluate(self, test_loader):
     return accuracy, f1, all_probabilities
 ```
 
-## ⚙️ **超参数调优**
+⚙️ 超参数调优
 
-### **分类器相关超参数**
+分类器相关超参数
 ```python
 # 在 egcn_trainer.py 中可调整的参数
 classifier_config = {
@@ -202,7 +200,7 @@ training_config = {
 }
 ```
 
-### **阈值敏感性分析**
+阈值敏感性分析
 ```python
 # 测试不同阈值的影响
 thresholds = [0.90, 0.92, 0.94, 0.95, 0.96, 0.98]
@@ -216,9 +214,9 @@ for threshold in thresholds:
     print(f"阈值 {threshold}: 剪枝率 {pruning_rate:.2%}")
 ```
 
-## 📈 **预期性能**
+📈 预期性能
 
-### **Softmax输出的典型分布**
+Softmax输出的典型分布
 ```
 训练良好的模型应该产生：
 
@@ -231,22 +229,3 @@ for threshold in thresholds:
 不确定的列：
   [0.45, 0.55] - 不太确定
 ```
-
-### **实际应用效果**
-```
-预期改进：
-✅ 剪枝准确率: 85%+ (vs 传统方法的75%)
-✅ 假阳性率: <5% (避免误删重要列)
-✅ 计算效率: 提升30-50%
-✅ 解质量: 保持或略有提升
-```
-
-## 💡 **总结**
-
-是的，你完全正确！EGCN训练完成后必须连接Softmax分类器：
-
-1. **EGCN**: 负责学习列的嵌入表示
-2. **Softmax**: 负责最终的冗余性分类决策
-3. **组合**: EGCN+Softmax形成完整的端到端模型
-
-当前的实现已经正确地包含了这个架构，并且在训练、验证和推理过程中都正确使用了Softmax分类器！🎯
