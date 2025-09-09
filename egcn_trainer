@@ -894,8 +894,7 @@ class EGCNTrainer:
         test_results = self.final_test_evaluation(test_dataset, save_path)
         
         print("\\n🎯 严格验证完成！")
-        print("这些结果是在完全独立的测试集上获得的，")
-        print("测试集从未用于训练或超参数调优，结果具有科学严谨性。")
+
         
         return test_results
     
@@ -947,7 +946,7 @@ class EGCNTrainer:
             self.train_history = checkpoint['train_history']
             self.val_history = checkpoint['val_history']
         
-        print(f"模型已从 {model_path} 加载完成")
+        print(f"模型已从 {} 加载完成")
         print(f"最佳验证F1: {checkpoint.get('best_val_f1', 'N/A')}")
     
     def evaluate_on_real_data(self, columns_features, similarity_threshold=0.95):
