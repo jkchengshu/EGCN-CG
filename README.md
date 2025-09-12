@@ -1,53 +1,68 @@
+Of course. Here is the English translation of the document.
+
 # EGCN-CG
+
 EGCN+CG
-# EGCN + Softmax 架构详解
 
+# EGCN + Softmax Architecture Explained
 
-完整的模型流程
+EGCN+CG
+
+# EGCN + Softmax Architecture Explained
+
+### Complete Model Pipeline
+
 ```
-输入列特征 → EGCN编码器 → 节点嵌入 → Softmax分类器 → 冗余性概率
-    ↓           ↓           ↓           ↓             ↓
- [features]  [node_emb]  [embeddings] [logits]   [probabilities]
- (N, F)      GCN+GRU     (N, H)      (N, 2)     (N, 2)
+Input Column Features → EGCN Encoder → Node Embeddings → Softmax Classifier → Redundancy Probability
+       ↓                 ↓                 ↓                  ↓                   ↓
+ [features]          [embeddings]      [embeddings]         [logits]        [probabilities]
+ (N, F)              GCN+GRU           (N, H)             (N, 2)            (N, 2)
 ```
 
-🔧 当前实现的架构
+---
 
-1. EGCN编码器部分
+### 🔧 Current Implemented Architecture
+
+#### 1. EGCN Encoder Part
+
 ```python
-# 在 egcn_trainer.py 中
+# In egcn_trainer.py
 self.model = EGCN(args, activation=F.relu, device=self.device)
 ```
 
-EGCN的功能：
-- ✅ 多关系图卷积（煤炭、时间、船只关系）
-- ✅ GRU动态权重更新
-- ✅ 生成节点嵌入表示
+**Functionality of EGCN:**
 
-2. Softmax分类器部分
+* ✅ Multi-relational graph convolution (coal, time, vessel relations)
+* ✅ Dynamic weight updates via GRU
+* ✅ Generates node embedding representations
+
+#### 2. Softmax Classifier Part
+
 ```python
-# 在 egcn_trainer.py 第128-133行
+# In egcn_trainer.py, lines 128-133
 self.classifier = nn.Sequential(
-    nn.Linear(args.layer_2_feats, 16),  # 隐藏层
-    nn.ReLU(),                          # 激活函数
-    nn.Dropout(0.2),                    # 防过拟合
-    nn.Linear(16, 2)                    # 二分类输出
+    nn.Linear(args.layer_2_feats, 16),  # Hidden Layer
+    nn.ReLU(),                          # Activation Function
+    nn.Dropout(0.2),                    # Prevent Overfitting
+    nn.Linear(16, 2)                    # Binary Classification Output
 ).to(self.device)
 ```
 
-Softmax分类器的功能：
-- ✅ 将EGCN的节点嵌入映射到2维logits
-- ✅ 通过Softmax得到概率分布
-- ✅ 输出冗余性预测
+**Functionality of the Softmax Classifier:**
 
-3. 前向传播流程
+* ✅ Maps EGCN's node embeddings to 2D logits
+* ✅ Obtains a probability distribution via Softmax
+* ✅ Outputs redundancy predictions
+
+#### 3. Forward Pass Pipeline
+
 ```python
-# 在训练和推理中的完整流程
+# The complete pipeline during training and inference
 def forward_pass(self, features, adj_matrices):
-    # 1. EGCN编码
+    # 1. EGCN Encoding
     node_embeddings, _ = self.model(adj_matrices, features)
     
-    # 2. Softmax分类
+    # 2. Softmax Classification
     logits = self.classifier(node_embeddings)
     probabilities = F.softmax(logits, dim=1)
     predictions = torch.argmax(probabilities, dim=1)
@@ -55,105 +70,118 @@ def forward_pass(self, features, adj_matrices):
     return predictions, probabilities
 ```
 
- 📊 输出解释
-Softmax输出格式
+---
+
+### 📊 Output Explanation
+
+#### Softmax Output Format
+
 ```python
-# 对于每个列，Softmax输出2个概率：
+# For each column, Softmax outputs 2 probabilities:
 probabilities = [
-    [P(冗余), P(非冗余)],     # 列1
-    [P(冗余), P(非冗余)],     # 列2
-    [P(冗余), P(非冗余)],     # 列3
+    [P(Redundant), P(Non-redundant)],     # Column 1
+    [P(Redundant), P(Non-redundant)],     # Column 2
+    [P(Redundant), P(Non-redundant)],     # Column 3
     ...
 ]
 
-# 例如：
+# For example:
 probabilities = [
-    [0.85, 0.15],  # 列1: 85%概率是冗余列
-    [0.23, 0.77],  # 列2: 77%概率是非冗余列  
-    [0.92, 0.08],  # 列3: 92%概率是冗余列
+    [0.85, 0.15],  # Column 1: 85% probability of being redundant
+    [0.23, 0.77],  # Column 2: 77% probability of being non-redundant  
+    [0.92, 0.08],  # Column 3: 92% probability of being redundant
 ]
 ```
 
-决策逻辑
+#### Decision Logic
+
 ```python
-# 基于概率进行决策
+# Making decisions based on probability
 for i, prob in enumerate(probabilities):
-    redundant_prob = prob[0]  # 冗余概率
-    non_redundant_prob = prob[1]  # 非冗余概率
+    redundant_prob = prob[0]      # Redundant probability
+    non_redundant_prob = prob[1]  # Non-redundant probability
     
-    if redundant_prob > THRESHOLD:  # 例如 0.95
-        decision = "剪枝这一列"
+    if redundant_prob > THRESHOLD:  # e.g., 0.95
+        decision = "Prune this column"
     else:
-        decision = "保留这一列"
+        decision = "Keep this column"
     
-    print(f"列{i}: 冗余概率={redundant_prob:.3f}, 决策={decision}")
+    print(f"Column {i}: Redundancy Prob={redundant_prob:.3f}, Decision={decision}")
 ```
 
-🎯 在CG算法中的应用
- 集成到CG算法中
+---
+
+### 🎯 Application in the CG Algorithm
+
+#### Integration into the CG Algorithm
+
 ```python
-# 在 CG_x_sn_rule_with_EGCN.py 中的应用
+# Application in CG_x_sn_rule_with_EGCN.py
 def egcn_redundancy_check(column_features):
-    """使用EGCN+Softmax进行冗余性检查"""
+    """Perform redundancy check using EGCN+Softmax"""
     
-    # 1. 准备输入数据
+    # 1. Prepare input data
     features = torch.tensor(column_features, dtype=torch.float32)
     adj_matrices = build_adjacency_matrices(features)
     
-    # 2. EGCN前向传播
+    # 2. EGCN forward pass
     with torch.no_grad():
         node_embeddings, _ = egcn_model(adj_matrices, features)
         
-        # 3. Softmax分类
+        # 3. Softmax classification
         logits = egcn_classifier(node_embeddings)
         probabilities = F.softmax(logits, dim=1)
     
-    # 4. 基于阈值决策
-    redundant_probs = probabilities[:, 0]  # 冗余概率
+    # 4. Decision based on threshold
+    redundant_probs = probabilities[:, 0]  # Redundancy probabilities
     is_redundant = redundant_probs > REDUNDANCY_THRESHOLD
     
     return is_redundant, probabilities
 
-# 在CG主循环中使用
+# Usage in the main CG loop
 for supplier in suppliers:
-    # 生成新列
+    # Generate new column
     new_column_features = solve_pricing_problem(supplier)
     
-    # EGCN+Softmax冗余性检查
+    # EGCN+Softmax redundancy check
     is_redundant, probs = egcn_redundancy_check(new_column_features)
     
     if is_redundant:
-        print(f"列被剪枝，冗余概率: {probs[0]:.3f}")
-        continue  # 跳过这一列
+        print(f"Column pruned, redundancy probability: {probs[0]:.3f}")
+        continue  # Skip this column
     else:
-        print(f"列被保留，非冗余概率: {probs[1]:.3f}")
+        print(f"Column kept, non-redundancy probability: {probs[1]:.3f}")
         add_column_to_master_problem(new_column_features)
 ```
 
-🔧 训练过程中的Softmax
+---
 
-损失函数
+### 🔧 Softmax during the Training Process
+
+#### Loss Function
+
 ```python
-# 使用交叉熵损失训练Softmax分类器
+# Training the Softmax classifier using cross-entropy loss
 def train_epoch(self, train_loader):
     for batch in train_loader:
         features, adj_matrices, labels = batch
         
-        # 前向传播
+        # Forward pass
         node_embeddings, _ = self.model(adj_matrices, features)
         logits = self.classifier(node_embeddings)
         
-        # 计算损失（自动包含Softmax）
+        # Calculate loss (Softmax is included automatically)
         loss = F.cross_entropy(logits, labels)
         
-        # 反向传播
+        # Backward pass
         loss.backward()
         self.optimizer.step()
 ```
 
-评估指标
+#### Evaluation Metrics
+
 ```python
-# 评估时计算各种指标
+# Calculating various metrics during evaluation
 def evaluate(self, test_loader):
     all_predictions = []
     all_probabilities = []
@@ -166,7 +194,7 @@ def evaluate(self, test_loader):
             node_embeddings, _ = self.model(adj_matrices, features)
             logits = self.classifier(node_embeddings)
             
-            # Softmax概率
+            # Softmax probabilities
             probabilities = F.softmax(logits, dim=1)
             predictions = torch.argmax(probabilities, dim=1)
             
@@ -174,58 +202,63 @@ def evaluate(self, test_loader):
             all_probabilities.extend(probabilities.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
     
-    # 计算准确率、F1等指标
+    # Calculate metrics like Accuracy, F1-score, etc.
     accuracy = accuracy_score(all_labels, all_predictions)
     f1 = f1_score(all_labels, all_predictions)
     
     return accuracy, f1, all_probabilities
 ```
 
-⚙️ 超参数调优
+---
 
-分类器相关超参数
+### ⚙️ Hyperparameter Tuning
+
+#### Classifier-related Hyperparameters
+
 ```python
-# 在 egcn_trainer.py 中可调整的参数
+# Adjustable parameters in egcn_trainer.py
 classifier_config = {
-    'hidden_dim': 16,        # 隐藏层维度
-    'dropout_rate': 0.2,     # Dropout比率
-    'num_classes': 2,        # 分类数（冗余/非冗余）
+    'hidden_dim': 16,        # Hidden layer dimension
+    'dropout_rate': 0.2,     # Dropout rate
+    'num_classes': 2,        # Number of classes (redundant/non-redundant)
 }
 
-# 训练相关超参数
+# Training-related Hyperparameters
 training_config = {
-    'learning_rate': 1e-3,   # 学习率
-    'weight_decay': 1e-5,    # 权重衰减
-    'redundancy_threshold': 0.95,  # 冗余判断阈值
+    'learning_rate': 1e-3,   # Learning rate
+    'weight_decay': 1e-5,    # Weight decay
+    'redundancy_threshold': 0.95,  # Redundancy judgment threshold
 }
 ```
 
-阈值敏感性分析
+#### Threshold Sensitivity Analysis
+
 ```python
-# 测试不同阈值的影响
+# Testing the impact of different thresholds
 thresholds = [0.90, 0.92, 0.94, 0.95, 0.96, 0.98]
 
 for threshold in thresholds:
     REDUNDANCY_THRESHOLD = threshold
     
-    # 在验证集上测试
+    # Test on the validation set
     pruning_rate = test_pruning_performance(val_dataset, threshold)
     
-    print(f"阈值 {threshold}: 剪枝率 {pruning_rate:.2%}")
+    print(f"Threshold {threshold}: Pruning Rate {pruning_rate:.2%}")
 ```
 
-📈 预期性能
+---
 
-Softmax输出的典型分布
-```
-训练良好的模型应该产生：
+### 📈 Expected Performance
 
-高置信度冗余列：
-  [0.95, 0.05] - 95%确信是冗余的
+#### Typical Distribution of Softmax Output
 
-高置信度非冗余列：
-  [0.08, 0.92] - 92%确信是非冗余的
+A well-trained model should produce:
 
-不确定的列：
-  [0.45, 0.55] - 不太确定
-```
+**High-confidence redundant columns:**
+`[0.95, 0.05]` - 95% confident it is redundant
+
+**High-confidence non-redundant columns:**
+`[0.08, 0.92]` - 92% confident it is non-redundant
+
+**Uncertain columns:**
+`[0.45, 0.55]` - Not very certain
