@@ -162,152 +162,203 @@ step5：求解计划生成完毕后还原0-1变量的主问题
 
 dt_all = sum(d_t[t] for t in T)
 
-# 初始化采购量数组
-total_cons_sn = np.zeros((S_num, N_num))
+stock = np.zeros(N_num)
+initial_stock = np.zeros(N_num)
 
-# 假设已经定义了 dt_all, p_n, ratio, k_s_n, S_num, N_num
-total_cons_sn = np.zeros((S_num, N_num))
+# 初始化每种煤的库存
+for n in N:
+    initial_stock[n] = l_n[n] - h_n[n]  # 初始库存计算
+    stock[n] = initial_stock[n]
 
-# 构造所有 (s, n) 对，并按性价比降序排列
-index_list = [(s, n) for s in range(S_num) for n in range(N_num)]
-ratio_list = [ratio[s, n] for s, n in index_list]
-sorted_indices = [idx for _, idx in sorted(zip(ratio_list, index_list), key=lambda pair: -pair[0])]
+# 计算煤炭比例
+coal_ratio = np.zeros((S_num, N_num))
+for s in S:
+    for n in N:
+        coal_ratio[s, n] = (v * p_n[n]) / (v * c_s_n_coal[s, n] + c_s_ship[s])
+print(coal_ratio)
+print(k_s_n)
 
-remaining_demand = dt_all  # 单位：能量
+# 初始化beta_supply字典
+beta_supply = {(s, n, t): 0 for s in S for n in N for t in T}
+# demand
+demand_total = sum(d_t[t] for t in T) - sum((l_n[n] - h_n[n]) * p_n[n] for n in N)
 
-for (s, n) in sorted_indices:
-    if remaining_demand <= 0:
+beta_supply_total = np.zeros((S_num, N_num))
+flat_idx = np.argsort(ratio.flatten())[::-1]
+remaining = demand_total
+for idx in flat_idx:
+    if remaining <= 0:
         break
-    # 该供应商和煤种能提供的总能量
-    available_energy = k_s_n[s, n] * p_n[n]
-    if available_energy >= remaining_demand:
-        # 当前对只需采购部分煤炭
-        purchase = remaining_demand / p_n[n]
-        total_cons_sn[s, n] = purchase
-        remaining_demand = 0
-    else:
-        total_cons_sn[s, n] = k_s_n[s, n]
-        remaining_demand -= available_energy
 
+    s = idx // N_num
+    n = idx % N_num
 
-# 此时 total_cons_sn 即为各供应商各煤种的采购量，满足总需求 dt_all
-def get_best_and_second_best_suppliers(n, ratio, S_num):
-    # 提取该煤炭种类的所有供应商的性价比
-    supplier_ratios = [(s, ratio[s, n]) for s in range(S_num)]
+    # 该 (s,n) 的最大可购量（吨）
+    max_available = k_s_n[s, n]
 
-    # 按照性价比降序排列
-    sorted_suppliers = sorted(supplier_ratios, key=lambda x: -x[1])
+    # 还需要多少吨该种煤来满足剩余发电需求
+    # 这里用热值 h_n[n] * 采购量 = 发电量
+    # 所以 采购量 = remaining / p_n[n]
+    needed_tons = remaining / p_n[n]
 
-    # 获取性价比最高和次高的供应商
-    best_supplier = sorted_suppliers[0][0]
-    second_best_supplier = sorted_suppliers[1][0]
+    # 实际采购，不能超过库存也不能超需求
+    buy = min(max_available, needed_tons)
 
-    return second_best_supplier
+    beta_supply_total[s, n] = buy
+    remaining -= buy * p_n[n]
 
+# 6. 打印结果
+print("beta_supply_total (各 s,n 采购量)：\n", beta_supply_total)
+print("剩余未满足发电量：", remaining)
+print(demand_total)
 
-for (s, n) in sorted_indices:
-    if total_cons_sn[s, n] > 2 * v:
-        second_best_supplier = get_best_and_second_best_suppliers(n, ratio, S_num)
-
-        total_cons_sn[s, n] -= v
-        total_cons_sn[second_best_supplier, n] += v
-
-berth_none = np.zeros(T_num)
-for t in T:
-    berth_none[t] = b
-
-print(total_cons_sn)
-alpha_op = np.zeros((S_num, N_num))
+# 定义煤炭属性
+coal_properties = {}
 for s in S:
     for n in N:
-        alpha_op[s, n] = total_cons_sn[s, n]
-m = Model()
-m.setParam("MIPGap", 0.79)
-m.setParam("Heuristics", 1)
-m.setParam("OutputFlag", 1)
-alpha = m.addVars(S_num, N_num, lb=0, ub=0, vtype=GRB.CONTINUOUS)
-beta = m.addVars(S_num, N_num, T_num, lb=0, ub=0, vtype=GRB.CONTINUOUS)
-gamma = m.addVars(S_num, T_num, lb=0, vtype=GRB.BINARY)
-miu = m.addVars(S_num, T_num, lb=0, vtype=GRB.INTEGER)
-tau = m.addVars(S_num, T_num, T_num, lb=0, vtype=GRB.BINARY)
-theta = m.addVars(N_num, T_num, lb=0, vtype=GRB.CONTINUOUS)
-rho = m.addVars(N_num, T_num, lb=0, vtype=GRB.CONTINUOUS)
+        coal_properties[(s, n)] = {
+            'ratio': coal_ratio[s, n],
+            'max_quantity': k_s_n[s, n]
+        }
 
-for s in S:
-    for t in T:
-        gamma[s, t] = m.addVar(lb=0, ub=1, vtype=GRB.BINARY)
-        miu[s, t] = m.addVar(lb=0, vtype=GRB.INTEGER)
-        for n in N:
-            beta[s, n, t] = m.addVar(lb=0, vtype=GRB.CONTINUOUS)
-        for t1 in range(t):
-            tau[s, t, t1] = m.addVar(lb=0, ub=0, vtype=GRB.BINARY)
-        for t1 in range(t, T_num):
-            tau[s, t, t1] = m.addVar(lb=0, ub=1, vtype=GRB.BINARY)
-    for n in N:
-        alpha[s, n] = m.addVar(lb=0, ub=k_s_n[s, n], vtype=GRB.CONTINUOUS)
-for n in N:
-    for t in T:
-        theta[n, t] = m.addVar(lb=0, ub=q_n[n], vtype=GRB.CONTINUOUS)
-        rho[n, t] = m.addVar(lb=0, ub=q_n[n], vtype=GRB.CONTINUOUS)
-objective = quicksum(
-    quicksum(c_s_n_coal[s, n] * alpha[s, n] for n in N) + quicksum(c_s_ship[s] * gamma[s, t] for t in T) for s in
-    S)
-m.setObjective(objective, GRB.MINIMIZE)
+berth_usage = {t: 0 for t in T}
 
-# 约束
-for s in S:
-    for n in N:
-        m.addConstr(alpha[s, n] >= alpha_ini[s, n])
-for s in S:
-    for n in N:
-        m.addConstr(alpha[s, n] >= quicksum(beta[s, n, t] for t in T))
-for s in S:
+
+# 检查泊位可用性
+def check_berth_availability(t):
+    return berth_usage[t] < b
+
+
+# 更新泊位使用情况
+def update_berth_usage(t, duration=8):
+    for day in range(t, min(t + duration, len(T) + 1)):
+        berth_usage[day] += 1
+
+
+# 检查指定时间段内泊位是否足够
+def check_berth_availability(t, duration=8):
+    return all(berth_usage[day] < b for day in range(t, min(t + duration, len(T))))
+
+import math
+import numpy as np
+from MT_para_real import *
+
+# …… 前面那些初始化保持不变 ……
+
+# 只做采购，不做燃烧
+def simulate_coal_purchase():
+    global stock, beta_supply, berth_usage
+
+    purchase_log = []
+    ship_filled_log = []
+
     for t in T:
-        m.addConstr(quicksum(beta[s, n, t] for n in N) <= v * gamma[s, t])
-for n in N:
-    m.addConstr(theta[n, 0] == l_n[n])
-for n in N:
-    for t in range(T_num - 1):
-        m.addConstr(theta[n, t + 1] == theta[n, t] + quicksum(beta[s, n, t] for s in S) - rho[n, t])
-for t in T:
-    m.addConstr(quicksum(rho[n, t] * p_n[n] for n in N) == d_t[t])
-for t in T:
-    for n in N:
-        m.addConstr(theta[n, t] >= h_n[n])
-        m.addConstr(theta[n, t] <= q_n[n])
-for s in S:
-    for t in T:
-        m.addConstr(u * (miu[s, t] - 1) <= quicksum(beta[s, n, t] for n in N))
-        m.addConstr(u * miu[s, t] >= quicksum(beta[s, n, t] for n in N))
-for s in S:
-    for t in T:
-        m.addConstr(tau[s, t, t] == gamma[s, t])
-for s in S:
-    for t in T:
-        m.addConstr(quicksum(tau[s, t, t1] for t1 in T) >= miu[s, t])
-for t in T:
-    for t1 in range(t, T_num):
+        # —— 1. 新到货更新库存
+        new_coal_arrival = np.array(
+            [beta_supply.get((s, n, t), 0) for n in N for s in S]
+        ).reshape(len(N), -1).sum(axis=1)
+        stock += new_coal_arrival
+
+        # —— 2. 记录采购 & 船舶装满情况
         for s in S:
-            m.addConstr(t1 * tau[s, t, t1] <= (t + miu[s, t] - 1) * gamma[s, t])
-for t1 in T:
-    m.addConstr(quicksum(tau[s, t, t1] for s in S for t in T) <= b)
-m.optimize()
-long_time = m.objVal
+            for n in N:
+                qty = beta_supply.get((s, n, t), 0)
+                if qty > 0:
+                    purchase_log.append((t, s, n, qty))
+                    ship_filled_log.append((t, s, n, 'Yes' if qty == v else 'No'))
 
-# 获取初始解
-alpha_op = np.zeros((S_num, N_num))
-gamma_op = np.zeros((S_num, T_num))
-beta_op = np.zeros((S_num, N_num, T_num))
-tau_op = np.zeros((S_num, T_num, T_num))
+        # —— 3. 更新泊位使用（如果你在这里需要的话）
+        #     比如：update_berth_usage(t)
+
+        # （不再做燃烧）
+
+    return purchase_log, ship_filled_log
+
+
+# 只做填充+燃烧
+def fill_coal_and_burn():
+    coal_burned = np.zeros((T_num, N_num))
+    power_generated = np.zeros(T_num)
+
+    remaining_to_buy = {
+        (s, n): beta_supply_total[s, n]
+        for s in S for n in N
+        if beta_supply_total[s, n] > 0
+    }
+
+    for t in T:
+        # —— 1. 安排装船 & 更新库存
+        for (s, n), need in sorted(remaining_to_buy.items(),
+                                  key=lambda x: p_n[x[0][1]],
+                                  reverse=True):
+            if need <= 0 or not check_berth_availability(t):
+                continue
+
+            cap_left = q_n[n] - stock[n]
+            if cap_left <= 0:
+                break
+
+            already = sum(beta_supply[(s, n, tt)] for tt in T)
+            max_by_sup = k_s_n[s, n] - already
+            v_remain = max(0, v - sum(beta_supply[(ss, nn, t)] for ss in S for nn in N))
+            load = min(need, max_by_sup, cap_left, v_remain)
+            if load <= 0:
+                continue
+
+            beta_supply[(s, n, t)] += load
+            remaining_to_buy[(s, n)] -= load
+            stock[n] += load
+            update_berth_usage(t)
+
+        # —— 2. 燃烧
+        heat_needed = d_t[t]
+        for n in sorted(N, key=lambda x: p_n[x]):
+            if heat_needed <= 0:
+                break
+            burn_qty = min(stock[n], heat_needed / p_n[n])
+            coal_burned[t, n] = burn_qty
+            stock[n] -= burn_qty
+            heat_needed -= burn_qty * p_n[n]
+            power_generated[t] += burn_qty * p_n[n]
+
+        print(f"Time {t}: generated {power_generated[t]:.1f}, burned {coal_burned[t]}, stock now {stock}")
+
+    return coal_burned, power_generated
+
+
+# —— 高层调用顺序
+purchase_log, ship_filled_log = simulate_coal_purchase()
+coal_burned, power_generated = fill_coal_and_burn()
+
+# 后续的 adjust_beta_supply、alpha_ini/beta_ini 计算等都不变
+# ……
+
+
+# 输出调整后的初始解
+alpha_ini = np.zeros((S_num, N_num))
+beta_ini = np.zeros((S_num, N_num, T_num))
+gamma_ini = np.zeros((S_num, T_num))
+tau_ini = np.zeros((S_num, T_num, T_num))
+temp_berth = np.zeros((S_num, T_num))
+
 for s in S:
     for n in N:
-        alpha_op[s, n] = alpha[s, n].X
+        alpha_ini[s, n] = sum(beta_supply[s, n, t] for t in T)
         for t in T:
-            beta_op[s, n, t] = beta[s, n, t].X
+            beta_ini[s, n, t] = beta_supply[s, n, t]
     for t in T:
-        gamma_op[s, t] = gamma[s, t].X
-        for t1 in T:
-            tau_op[s, t, t1] = tau[s, t, t1].X
+        if sum(beta_supply[s, n, t] for n in N) > 0.1:
+            gamma_ini[s, t] = 1
+            temp = math.ceil(sum(beta_supply[s, n, t] for n in N) / u)
+            print(temp)
+            for t_prime in range(t, min(t + temp, T_num)):
+                tau_ini[s, t, t_prime] = 1
+
+# 计算每个供应商与煤种的总购买量
+total_purchase = np.zeros((S_num, N_num))
+for s in S:
+    for n in N:
+        total_purchase[s, n] = sum(beta_supply[(s, n, t)] for t in T)
 
 print(alpha_op)
 print(gamma_op)
