@@ -235,7 +235,7 @@ training_config = {
 
 ```python
 # Testing the impact of different thresholds
-thresholds = [0.90, 0.92, 0.94, 0.95, 0.96, 0.98]
+thresholds = [0.90, 0.93, 0.95, 0.97, 0.99]
 
 for threshold in thresholds:
     REDUNDANCY_THRESHOLD = threshold
