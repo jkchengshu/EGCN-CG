@@ -1,0 +1,106 @@
+from gurobipy import *
+import time
+import math
+import numpy as np
+import random
+from MT_para_real import *
+
+st = time.time()
+
+
+m = Model()
+# m.setParam("MIPGap", 0.24)
+# m.setParam("MIPGap", 0.20)
+m.setParam("MIPGap", 0)
+# m.setParam("TimeLimit", 300)
+# m.setParam("Heuristics", 0)
+m.setParam("OutputFlag", 1)
+alpha = m.addVars(S_num, N_num, lb=0, ub=0, vtype=GRB.CONTINUOUS)
+beta = m.addVars(S_num, N_num, T_num, lb=0, ub=0, vtype=GRB.CONTINUOUS)
+gamma = m.addVars(S_num, T_num, lb=0, vtype=GRB.BINARY)
+miu = m.addVars(S_num, T_num, lb=0, vtype=GRB.INTEGER)
+tau = m.addVars(S_num, T_num, T_num, lb=0, vtype=GRB.BINARY)
+theta = m.addVars(N_num, T_num, lb=0, vtype=GRB.CONTINUOUS)
+rho = m.addVars(N_num, T_num, lb=0, vtype=GRB.CONTINUOUS)
+phi_L = m.addVars(S_num, T_num, vtype=GRB.CONTINUOUS)
+
+for s in S:
+    for t in T:
+
+        gamma[s, t] = m.addVar(lb=0, ub=1, vtype=GRB.BINARY)
+        miu[s, t] = m.addVar(lb=0, vtype=GRB.INTEGER)
+        for n in N:
+            beta[s, n, t] = m.addVar(lb=0, vtype=GRB.CONTINUOUS)
+        for t1 in range(t):
+            tau[s, t, t1] = m.addVar(lb=0, ub=0, vtype=GRB.BINARY)
+        for t1 in range(t, T_num):
+            tau[s, t, t1] = m.addVar(lb=0, ub=1, vtype=GRB.BINARY)
+    for n in N:
+        alpha[s, n] = m.addVar(lb=0, ub=k_s_n[s, n], vtype=GRB.CONTINUOUS)
+for n in N:
+    for t in T:
+        theta[n, t] = m.addVar(lb=0, ub=q_n[n], vtype=GRB.CONTINUOUS)
+        rho[n, t] = m.addVar(lb=0, ub=q_n[n], vtype=GRB.CONTINUOUS)
+objective = quicksum(
+    quicksum(c_s_n_coal[s, n] * alpha[s, n] for n in N) + quicksum(c_s_ship[s] * gamma[s, t] for t in T) for s in
+    S)
+m.setObjective(objective, GRB.MINIMIZE)
+# 2
+for s in S:
+    for n in N:
+        m.addConstr(alpha[s, n] <= k_s_n[s, n])
+# 3
+for s in S:
+    for n in N:
+        m.addConstr(alpha[s, n] >= quicksum(beta[s, n, t] for t in T))
+# 4
+for s in S:
+    for t in T:
+        m.addConstr(quicksum(beta[s, n, t] for n in N) <= v * gamma[s, t])
+# 5
+for n in N:
+    m.addConstr(theta[n, 0] == l_n[n])
+# 6
+for n in N:
+    for t in range(T_num - 1):
+        m.addConstr(theta[n, t + 1] == theta[n, t] + quicksum(beta[s, n, t] for s in S) - rho[n, t])
+# 7
+for t in T:
+    m.addConstr(quicksum(rho[n, t] * p_n[n] for n in N) == d_t[t])
+# 8
+for t in T:
+    for n in N:
+        m.addConstr(theta[n, t] >= h_n[n])
+        m.addConstr(theta[n, t] <= q_n[n])
+# 9
+for s in S:
+    for t in T:
+        m.addConstr(u * (miu[s, t] - 1) <= quicksum(beta[s, n, t] for n in N))
+        m.addConstr(u * miu[s, t] >= quicksum(beta[s, n, t] for n in N))
+# 10
+for s in S:
+    for t in T:
+        m.addConstr(tau[s, t, t] == gamma[s, t])
+# 11
+for s in S:
+    for t in T:
+        m.addConstr(quicksum(tau[s, t, t1] for t1 in T) >= miu[s, t])
+# 12
+for t in T:
+    for t1 in range(t, T_num):
+        for s in S:
+            m.addConstr(t1 * tau[s, t, t1] <= (t - 1) * gamma[s, t] +phi_L[s, t])
+# 13
+for t1 in T:
+    m.addConstr(quicksum(tau[s, t, t1] for s in S for t in T) <= b)
+
+for s in S:
+    for t in T:
+        m.addConstr(phi_L[s, t] <= M * gamma[s, t])
+        m.addConstr(phi_L[s, t] <= miu[s, t])
+        m.addConstr(phi_L[s, t] >= miu[s, t] - M * (1 - gamma[s, t]))
+m.optimize()
+
+print(f"{m.objVal}")
+
+print(f"{m.objVal}      {time.time() - st}")
