@@ -1,0 +1,690 @@
+import os
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+import math
+from set_initial_solution_next import *
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import numpy as np
+from gurobipy import *
+import time
+from MT_para_real import *
+from scipy.spatial.distance import euclidean
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import networkx as nx
+
+# 导入我们的EGCN实现和训练器
+from egcn_o import EGCN
+from egcn_trainer import EGCNTrainer
+import utils as u
+
+# =========================================================================
+# ============= EGCN初始化部分 ===============================================
+# =========================================================================
+
+# 初始化EGCN训练器和模型
+print("正在初始化EGCN模型...")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+egcn_trainer = EGCNTrainer(device=device)
+
+# 尝试加载预训练模型，如果不存在则使用未训练的模型
+model_path = 'PP+ML/egcn_trained_model.pth'
+if os.path.exists(model_path):
+    print(f"发现预训练模型，正在加载: {model_path}")
+    egcn_trainer.load_model(model_path)
+    print("✅ 预训练模型加载成功")
+else:
+    print("⚠️  未发现预训练模型，使用随机初始化的模型")
+    print("建议先运行 egcn_trainer.py 进行训练")
+
+egcn_model = egcn_trainer.model
+egcn_classifier = egcn_trainer.classifier
+
+# EGCN相关参数
+REDUNDANCY_THRESHOLD = 0.95  # 论文中的阈值
+all_column_features = []  # 存储所有列的特征
+all_column_embeddings = None  # 存储所有列的嵌入
+
+print(f"EGCN模型已初始化，使用设备: {device}")
+
+
+def extract_column_features(coal_quantities, time_overlap, vessel_count):
+    """
+    从列信息中提取特征向量
+
+    Args:
+        coal_quantities: (N_num,) 各种煤炭的采购量
+        time_overlap: (T_num,) 各时刻的泊位占用情况
+        vessel_count: 标量，使用的船只数量
+
+    Returns:
+        feature_vector: (N_num + T_num + 1,) 特征向量
+    """
+    coal_quantities = np.array(coal_quantities)
+    time_overlap = np.array(time_overlap)
+    vessel_count = np.array([vessel_count])
+
+    feature_vector = np.concatenate([coal_quantities, time_overlap, vessel_count])
+    return feature_vector
+
+
+def egcn_redundancy_check(new_column_features):
+    """
+    使用训练好的EGCN检查新列是否冗余
+
+    Args:
+        new_column_features: 新列的特征向量
+
+    Returns:
+        is_redundant: bool, 是否冗余
+        redundancy_info: dict, 冗余信息
+    """
+    global all_column_features, all_column_embeddings
+
+    if len(all_column_features) == 0:
+        return False, {'max_probability': 0.0, 'redundant_with': None}
+
+    # 使用训练器的评估方法
+    with torch.no_grad():
+        egcn_model.eval()
+        egcn_classifier.eval()
+
+        # 准备输入数据
+        all_features = all_column_features + [new_column_features]
+        features = torch.tensor(np.array(all_features), dtype=torch.float32, device=device)
+
+        # 构建邻接矩阵
+        adj_matrices = egcn_trainer.generate_adjacency_matrices(features)
+        for rel_type in adj_matrices:
+            adj_matrices[rel_type] = adj_matrices[rel_type].to(device)
+
+        # 计算聚合特征
+        X_new = torch.tensor(new_column_features, dtype=torch.float32, device=device)
+
+        # EGCN前向传播
+        node_embeddings, _ = egcn_model.forward(
+            node_features=features,
+            X_new=X_new,
+            existing_embeddings=all_column_embeddings,
+            update_weights=True
+        )
+
+        # 使用训练好的分类器
+        logits = egcn_classifier(node_embeddings)
+        probabilities = F.softmax(logits, dim=1)
+        predictions = torch.argmax(logits, dim=1)
+
+        # 更新嵌入（除了最新的列）
+        all_column_embeddings = node_embeddings[:-1] if len(all_column_features) > 0 else None
+
+        # 检查最后一列（新列）的预测结果
+        new_column_prediction = predictions[-1].item()
+        new_column_probabilities = probabilities[-1]
+
+        redundant_prob = new_column_probabilities[0].item()  # 冗余概率
+        non_redundant_prob = new_column_probabilities[1].item()  # 非冗余概率
+
+        # 如果预测为冗余（标签0）或者冗余概率超过阈值
+        is_redundant = (new_column_prediction == 0) or (redundant_prob > REDUNDANCY_THRESHOLD)
+
+        # 找到最相似的现有列（基于嵌入相似度）
+        if len(all_column_features) > 0 and all_column_embeddings is not None:
+            new_embedding = node_embeddings[-1].unsqueeze(0)
+            existing_embeddings = node_embeddings[:-1]
+
+            # 计算余弦相似度
+            similarities = F.cosine_similarity(new_embedding, existing_embeddings, dim=1)
+            most_similar_idx = torch.argmax(similarities).item()
+            max_similarity = similarities[most_similar_idx].item()
+        else:
+            most_similar_idx = None
+            max_similarity = 0.0
+
+        return is_redundant, {
+            'max_probability': redundant_prob,
+            'redundant_with': most_similar_idx,
+            'similarity': max_similarity,
+            'non_redundant_prob': non_redundant_prob
+        }
+
+
+cg_st = time.time()
+"""
+step1: 得到一个初始解--1个计划
+step2：根据初始解更新几个全局数组
+step3：求解主问题--将主问题得到的对偶变量传递给子问题
+step4：迭代求解子问题
+    4.1 判断子问题求解完毕的reduce cost是否小于0
+     4.1.1 若<=0，则更新全局数组里的信息，重新求解主问题
+     4.1.2 若>0， 停止迭代
+step5：求解计划生成完毕后还原0-1变量的主问题
+"""
+
+dt_all = sum(d_t[t] for t in T)
+
+stock = np.zeros(N_num)
+initial_stock = np.zeros(N_num)
+
+# 初始化每种煤的库存
+for n in N:
+    initial_stock[n] = l_n[n] - h_n[n]  # 初始库存计算
+    stock[n] = initial_stock[n]
+
+# 计算煤炭比例
+coal_ratio = np.zeros((S_num, N_num))
+for s in S:
+    for n in N:
+        coal_ratio[s, n] = (v * p_n[n]) / (v * c_s_n_coal[s, n] + c_s_ship[s])
+print(coal_ratio)
+print(k_s_n)
+
+# 初始化beta_supply字典
+beta_supply = {(s, n, t): 0 for s in S for n in N for t in T}
+# demand
+demand_total = sum(d_t[t] for t in T) - sum((l_n[n] - h_n[n]) * p_n[n] for n in N)
+
+beta_supply_total = np.zeros((S_num, N_num))
+flat_idx = np.argsort(ratio.flatten())[::-1]
+remaining = demand_total
+for idx in flat_idx:
+    if remaining <= 0:
+        break
+
+    s = idx // N_num
+    n = idx % N_num
+
+    # 该 (s,n) 的最大可购量（吨）
+    max_available = k_s_n[s, n]
+
+    # 还需要多少吨该种煤来满足剩余发电需求
+    # 这里用热值 h_n[n] * 采购量 = 发电量
+    # 所以 采购量 = remaining / p_n[n]
+    needed_tons = remaining / p_n[n]
+
+    # 实际采购，不能超过库存也不能超需求
+    buy = min(max_available, needed_tons)
+
+    beta_supply_total[s, n] = buy
+    remaining -= buy * p_n[n]
+
+# 6. 打印结果
+print("beta_supply_total (各 s,n 采购量)：\n", beta_supply_total)
+print("剩余未满足发电量：", remaining)
+print(demand_total)
+
+# 定义煤炭属性
+coal_properties = {}
+for s in S:
+    for n in N:
+        coal_properties[(s, n)] = {
+            'ratio': coal_ratio[s, n],
+            'max_quantity': k_s_n[s, n]
+        }
+
+berth_usage = {t: 0 for t in T}
+
+
+# 检查泊位可用性
+def check_berth_availability(t):
+    return berth_usage[t] < b
+
+
+# 更新泊位使用情况
+def update_berth_usage(t, duration=8):
+    for day in range(t, min(t + duration, len(T) + 1)):
+        berth_usage[day] += 1
+
+
+# 检查指定时间段内泊位是否足够
+def check_berth_availability(t, duration=8):
+    return all(berth_usage[day] < b for day in range(t, min(t + duration, len(T))))
+
+
+import math
+import numpy as np
+from MT_para_real import *
+
+
+# …… 前面那些初始化保持不变 ……
+
+# 只做采购，不做燃烧
+def simulate_coal_purchase():
+    global stock, beta_supply, berth_usage
+
+    purchase_log = []
+    ship_filled_log = []
+
+    for t in T:
+        # —— 1. 新到货更新库存
+        new_coal_arrival = np.array(
+            [beta_supply.get((s, n, t), 0) for n in N for s in S]
+        ).reshape(len(N), -1).sum(axis=1)
+        stock += new_coal_arrival
+
+        # —— 2. 记录采购 & 船舶装满情况
+        for s in S:
+            for n in N:
+                qty = beta_supply.get((s, n, t), 0)
+                if qty > 0:
+                    purchase_log.append((t, s, n, qty))
+                    ship_filled_log.append((t, s, n, 'Yes' if qty == v else 'No'))
+
+        # —— 3. 更新泊位使用（如果你在这里需要的话）
+        #     比如：update_berth_usage(t)
+
+        # （不再做燃烧）
+
+    return purchase_log, ship_filled_log
+
+
+# 只做填充+燃烧
+def fill_coal_and_burn():
+    coal_burned = np.zeros((T_num, N_num))
+    power_generated = np.zeros(T_num)
+
+    remaining_to_buy = {
+        (s, n): beta_supply_total[s, n]
+        for s in S for n in N
+        if beta_supply_total[s, n] > 0
+    }
+
+    for t in T:
+        # —— 1. 安排装船 & 更新库存
+        for (s, n), need in sorted(remaining_to_buy.items(),
+                                   key=lambda x: p_n[x[0][1]],
+                                   reverse=True):
+            if need <= 0 or not check_berth_availability(t):
+                continue
+
+            cap_left = q_n[n] - stock[n]
+            if cap_left <= 0:
+                break
+
+            already = sum(beta_supply[(s, n, tt)] for tt in T)
+            max_by_sup = k_s_n[s, n] - already
+            v_remain = max(0, v - sum(beta_supply[(ss, nn, t)] for ss in S for nn in N))
+            load = min(need, max_by_sup, cap_left, v_remain)
+            if load <= 0:
+                continue
+
+            beta_supply[(s, n, t)] += load
+            remaining_to_buy[(s, n)] -= load
+            stock[n] += load
+            update_berth_usage(t)
+
+        # —— 2. 燃烧
+        heat_needed = d_t[t]
+        for n in sorted(N, key=lambda x: p_n[x]):
+            if heat_needed <= 0:
+                break
+            burn_qty = min(stock[n], heat_needed / p_n[n])
+            coal_burned[t, n] = burn_qty
+            stock[n] -= burn_qty
+            heat_needed -= burn_qty * p_n[n]
+            power_generated[t] += burn_qty * p_n[n]
+
+        print(f"Time {t}: generated {power_generated[t]:.1f}, burned {coal_burned[t]}, stock now {stock}")
+
+    return coal_burned, power_generated
+
+
+# —— 高层调用顺序
+purchase_log, ship_filled_log = simulate_coal_purchase()
+coal_burned, power_generated = fill_coal_and_burn()
+
+# 后续的 adjust_beta_supply、alpha_ini/beta_ini 计算等都不变
+# ……
+
+
+# 输出调整后的初始解
+alpha_ini = np.zeros((S_num, N_num))
+beta_ini = np.zeros((S_num, N_num, T_num))
+gamma_ini = np.zeros((S_num, T_num))
+tau_ini = np.zeros((S_num, T_num, T_num))
+temp_berth = np.zeros((S_num, T_num))
+
+for s in S:
+    for n in N:
+        alpha_ini[s, n] = sum(beta_supply[s, n, t] for t in T)
+        for t in T:
+            beta_ini[s, n, t] = beta_supply[s, n, t]
+    for t in T:
+        if sum(beta_supply[s, n, t] for n in N) > 0.1:
+            gamma_ini[s, t] = 1
+            temp = math.ceil(sum(beta_supply[s, n, t] for n in N) / u)
+            print(temp)
+            for t_prime in range(t, min(t + temp, T_num)):
+                tau_ini[s, t, t_prime] = 1
+
+# 计算每个供应商与煤种的总购买量
+total_purchase = np.zeros((S_num, N_num))
+for s in S:
+    for n in N:
+        total_purchase[s, n] = sum(beta_supply[(s, n, t)] for t in T)
+
+print(alpha_op)
+print(gamma_op)
+print(beta_op)
+print(tau_op)
+
+print("正在为初始解提取特征...")
+for s in S:
+    # 提取初始列的特征
+    coal_quantities = alpha_op[s, :]
+    time_overlap = np.sum(tau_op[s, :, :], axis=0)
+    vessel_count = np.sum(gamma_op[s, :])
+
+    feature_vector = extract_column_features(coal_quantities, time_overlap, vessel_count)
+    all_column_features.append(feature_vector)
+
+print(f"已为 {len(all_column_features)} 个初始列提取特征")
+
+E_ogLen = S_num
+
+E_s_dict = {s: [s] for s in S}
+E_s_og = np.zeros(S_num, dtype=int)
+for s in S:
+    E_s_og[s] = s
+
+c_es_s_Plan = {(e_s, s): sum(c_s_n_coal[s, n] * alpha_op[s, n] for n in N) + sum(
+    c_s_ship[s] * gamma_op[s, t] for t in T) for s in S for e_s in E_s_dict[s]}
+
+
+def MP(E_len, beta_mp, tau_mp, c_es_Plan_mp, E_s_dict, CorNot):
+    mpst = time.time()
+    pi_s_2c = np.zeros(S_num)
+    pi_t1_7c = np.zeros(T_num)
+    pi_n_t_4c = np.zeros((N_num, T_num - 1))
+    # RLMP 启动！！！！！
+    mp = Model("RLMP")
+    mp.setParam("OutputFlag", 1)
+    mp.setParam("MIPGap", 0)
+    if CorNot == 1:
+        phi = mp.addVars(E_len, S_num, lb=0, vtype=GRB.CONTINUOUS)
+    else:
+        phi = mp.addVars(E_len, S_num, lb=0, vtype=GRB.BINARY)
+    theta = mp.addVars(N_num, T_num, lb=0, vtype=GRB.CONTINUOUS)
+    rho = mp.addVars(N_num, T_num, lb=0, vtype=GRB.CONTINUOUS)
+    mpobjective = quicksum(phi[e_s, s] * c_es_Plan_mp[e_s, s] for s in S for e_s in E_s_dict[s])
+    mp.update()
+    mp.setObjective(mpobjective, GRB.MINIMIZE)
+    cons = {}
+    cons[0] = [[] for s in S]  # phi2c
+    for s in S:
+        cons[0][s] = mp.addConstr(quicksum(phi[e_s, s] for e_s in E_s_dict[s]) <= 1)
+    cons[1] = [[] for n in N]
+    for n in N:
+        cons[1][n] = mp.addConstr(theta[n, 0] == l_n[n])
+    cons[2] = [[[] for t in T] for n in N]  # phi4c
+    for n in N:
+        for t in range(T_num - 1):
+            cons[2][n][t] = mp.addConstr(theta[n, t + 1] == theta[n, t] + quicksum(
+                phi[e_s, s] * beta_mp[e_s, n, t] for s in S for e_s in E_s_dict[s]) - rho[n, t])
+    cons[3] = [[] for t in T]  # 5b
+    for t in T:
+        cons[3][t] = mp.addConstr(quicksum(p_n[n] * rho[n, t] for n in N) >= d_t[t])
+    cons[4] = [[[] for t in T] for n in N]
+    cons[5] = [[[] for t in T] for n in N]
+    for n in N:
+        for t in T:
+            cons[4][n][t] = mp.addConstr(theta[n, t] <= q_n[n])
+            cons[5][n][t] = mp.addConstr(theta[n, t] >= h_n[n])
+    cons[6] = [[] for t1 in T]  # phi7c
+    for t1 in T:
+        cons[6][t1] = mp.addConstr(
+            quicksum(phi[e_s, s] * tau_mp[e_s, t, t1] for t in T for s in S for e_s in E_s_dict[s]) <= b)
+    mp.addConstrs(
+        quicksum(beta_mp[e_s, n, t] * phi[e_s, s] for e_s in E_s_dict[s] for t in T) <= k_s_n[s, n] for s in S for n in
+        N)
+    mp.optimize()
+
+    if mp.status == GRB.OPTIMAL and CorNot == 1:  # 检查优化状态
+        for s in S:
+            pi_s_2c[s] = cons[0][s].Pi
+        for n in N:
+            for t in range(T_num - 1):
+                pi_n_t_4c[n, t] = cons[2][n][t].Pi
+        for t1 in T:
+            pi_t1_7c[t1] = cons[6][t1].Pi
+
+    status = mp.Status
+    beta_cons = np.zeros((S_num, N_num, T_num))
+
+    for s in S:
+        for n in N:
+            for t in T:
+                beta_cons[s, n, t] = sum(phi[e_s, s].X * beta_mp[e_s, n, t] for e_s in E_s_dict[s])
+    currobj = mp.ObjVal
+    return status, pi_s_2c, pi_n_t_4c, pi_t1_7c, currobj, beta_cons
+
+
+def SP(pi_s_2c, pi_n_t_4c, pi_t1_7c, s_select, ban_coal_features):
+    """
+    修改后的定价问题，集成EGCN约束
+
+    Args:
+        ban_coal_features: 被禁止的特征列表（由EGCN判断的冗余列特征）
+    """
+    ppst = time.time()
+    sp = Model("PP")
+    sp.setParam("OutputFlag", 1)
+    sp.setParam("MIPGap", 0)
+    sp.setParam("TimeLimit", 600)
+    alpha_pp = sp.addVars(N_num, lb=0, vtype=GRB.CONTINUOUS)
+    beta_pp1 = sp.addVars(N_num, T_num, lb=0, vtype=GRB.CONTINUOUS)
+    gamma_pp = sp.addVars(T_num, lb=0, vtype=GRB.BINARY)
+    miu_pp = sp.addVars(T_num, lb=0, vtype=GRB.INTEGER)
+    tau_pp1 = sp.addVars(T_num, T_num, lb=0, vtype=GRB.BINARY)
+
+    epsilon = 0.000002  # 论文中的小正数
+
+    for i, banned_features in enumerate(ban_coal_features):
+        if np.any(banned_features != 0):
+            print(f"添加EGCN约束 {i}: 避免生成与已知冗余列相似的解")
+
+            # 创建辅助变量用于绝对值约束
+            coal_ban_var = sp.addVars(N_num, lb=0, vtype=GRB.CONTINUOUS)
+            time_ban_var = sp.addVars(T_num, lb=0, vtype=GRB.CONTINUOUS)
+            vessel_ban_var = sp.addVar(lb=0, vtype=GRB.CONTINUOUS)
+
+            # 煤炭数量约束
+            for n in N:
+                banned_coal = banned_features[n]
+                sp.addConstr(coal_ban_var[n] >= alpha_pp[n] - banned_coal)
+                sp.addConstr(coal_ban_var[n] >= -alpha_pp[n] + banned_coal)
+                sp.addConstr(coal_ban_var[n] <= epsilon * max(abs(banned_coal), 1.0))
+
+            # 时间重叠约束
+            for t in T:
+                banned_time = banned_features[N_num + t]
+                time_overlap_expr = quicksum(tau_pp1[t1, t] for t1 in T)
+                sp.addConstr(time_ban_var[t] >= time_overlap_expr - banned_time)
+                sp.addConstr(time_ban_var[t] >= -time_overlap_expr + banned_time)
+                sp.addConstr(time_ban_var[t] <= epsilon * max(abs(banned_time), 1.0))
+
+            # 船只数量约束
+            banned_vessel = banned_features[N_num + T_num]
+            vessel_expr = quicksum(gamma_pp[t] for t in T)
+            sp.addConstr(vessel_ban_var >= vessel_expr - banned_vessel)
+            sp.addConstr(vessel_ban_var >= -vessel_expr + banned_vessel)
+            sp.addConstr(vessel_ban_var <= epsilon * max(abs(banned_vessel), 1.0))
+
+            # 总约束（论文中的约束58）
+            total_diff = quicksum(coal_ban_var[n] for n in N) + \
+                         quicksum(time_ban_var[t] for t in T) + \
+                         vessel_ban_var
+            sp.addConstr(total_diff >= epsilon)
+
+    for t in T:
+        for t1 in range(t):
+            sp.addConstr(tau_pp1[t, t1] == 0)
+        for t1 in range(t, T_num):
+            sp.addConstr(tau_pp1[t, t1] <= 1)
+
+    c_es_s_PlanPP = quicksum(alpha_pp[n] * c_s_n_coal[s_select, n] for n in N) + quicksum(
+        c_s_ship[s_select] * gamma_pp[t] for t in T)
+    ppobjective = c_es_s_PlanPP - pi_s_2c - quicksum(
+        tau_pp1[t, t1] * pi_t1_7c[t1] for t in T for t1 in T) + quicksum(
+        beta_pp1[n, t] * pi_n_t_4c[n, t] for n in N for t in range(T_num - 1))
+    sp.setObjective(ppobjective, GRB.MINIMIZE)
+    sp.addConstrs(alpha_pp[n] <= k_s_n[s_select, n] for n in N)
+    sp.addConstrs(alpha_pp[n] == quicksum(beta_pp1[n, t] for t in T) for n in N)
+    sp.addConstrs(quicksum(beta_pp1[n, t] for n in N) <= v * gamma_pp[t] for t in T)
+    sp.addConstrs(miu_pp[t] - 1 <= quicksum(beta_pp1[n, t] for n in N) * (1 / u) for t in T)
+    sp.addConstrs(miu_pp[t] >= quicksum(beta_pp1[n, t] for n in N) * (1 / u) for t in T)
+    sp.addConstrs(tau_pp1[t, t] == gamma_pp[t] for t in T)
+    sp.addConstrs(quicksum(tau_pp1[t, t1] for t1 in range(t, T_num)) == miu_pp[t] for t in T)
+    sp.addConstrs(t1 * tau_pp1[t, t1] <= (t + miu_pp[t] - 1) * gamma_pp[t] for t in T for t1 in range(t, T_num))
+    sp.update()
+    sp.optimize()
+
+    c_es_PlanPP = sum(alpha_pp[n].X * c_s_n_coal[s_select, n] for n in N) + sum(
+        c_s_ship[s_select] * gamma_pp[t].X for t in T)
+    reduce_cost = sp.ObjVal
+    beta_pp_out = np.zeros((N_num, T_num))
+    tau_pp_out = np.zeros((T_num, T_num))
+
+    for t in T:
+        for n in N:
+            beta_pp_out[n, t] = beta_pp1[n, t].X
+        for t1 in T:
+            tau_pp_out[t, t1] = tau_pp1[t, t1].X
+
+    for n in N:
+        if alpha_pp[n].X > 0:
+            print(f"新一列中，从供应商{s_select} 购买{n}类煤炭的量为{alpha_pp[n].X}")
+            for t in T:
+                if beta_pp1[n, t].X > 0:
+                    print(beta_pp1[n, t].X)
+    for t in T:
+        if gamma_pp[t].X > 0:
+            print(f"新一列中，供应商{s_select} 船舶{gamma_pp[t].X} 在时刻{t}出发")
+
+    # 提取特征
+    feature_coal_quantity = np.zeros(N_num)
+    feature_time_overlap = np.zeros(T_num)
+    feature_vessel = 0
+    for n in N:
+        feature_coal_quantity[n] = sum(beta_pp_out[n, t] for t in T)
+    for t in T:
+        feature_time_overlap[t] = sum(tau_pp_out[t1, t] for t1 in T)
+    feature_vessel = sum(gamma_pp[t].X for t in T)
+    print("total_vessel", feature_vessel)
+
+    return beta_pp_out, tau_pp_out, c_es_PlanPP, reduce_cost, feature_coal_quantity, feature_time_overlap, feature_vessel
+
+
+# =========================================================================
+# ============= 主要的CG循环（集成EGCN判断）===============================
+# =========================================================================
+
+eps = -0.001
+E_len = E_ogLen
+beta_mp = beta_op
+tau_mp = tau_op
+c_es_s_Plan_mp = c_es_s_Plan
+E_s_dict_mp = E_s_dict
+
+status, pi_s_2c_mp, pi_n_t_4c_mp, pi_t1_7c_mp, noidea, _ = MP(E_len, beta_mp, tau_mp, c_es_s_Plan_mp, E_s_dict_mp, 1)
+iternum = 0
+reduce_cost = np.array([0, -1, -2])
+
+# 每个供应商的被禁特征集合（由EGCN判断的冗余列）
+ban_coal_features_dict = {s: [] for s in S}
+
+# 统计信息
+total_generated_columns = 0
+total_pruned_by_egcn = 0
+
+print("=" * 60)
+print("开始列生成主循环 - 集成EGCN剪枝")
+print("=" * 60)
+
+while status == GRB.OPTIMAL:
+    status, pi_s_2c_mp, pi_n_t_4c_mp, pi_t1_7c_mp, currobj, cons = MP(E_len, beta_mp, tau_mp, c_es_s_Plan_mp,
+                                                                      E_s_dict_mp, 1)
+
+    if reduce_cost.sum() > eps:
+        print(f"目标函数值：{currobj}")
+        print("共迭代", iternum, "次")
+        print(f"operatime:{time.time() - cg_st}")
+        break
+
+    reduce_cost = np.zeros(S_num)
+    columns_added_this_iter = 0
+
+    for s2 in S:
+        beta_pp, tau_pp, c_es_PlanPP, reduce_cost[s2], feature_coal_quantity, feature_time_overlap, feature_vessel = SP(
+            pi_s_2c_mp[s2], pi_n_t_4c_mp, pi_t1_7c_mp, s2, ban_coal_features_dict[s2])
+
+        total_generated_columns += 1
+
+        # 提取新列的完整特征
+        new_column_features = extract_column_features(feature_coal_quantity, feature_time_overlap, feature_vessel)
+
+        print(f"\n--- 供应商 {s2} 的新列EGCN评估 ---")
+        is_redundant, redundancy_info = egcn_redundancy_check(new_column_features)
+
+        if is_redundant:
+            print(f"EGCN判断: 冗余列 (冗余概率: {redundancy_info['max_probability']:.3f})")
+            if redundancy_info['redundant_with'] is not None:
+                print(
+                    f"与现有列 {redundancy_info['redundant_with']} 最相似 (相似度: {redundancy_info['similarity']:.3f})")
+            print("该列被剪枝，不添加到主问题")
+
+            # 将该特征添加到被禁列表，防止再次生成相似的列
+            ban_coal_features_dict[s2].append(new_column_features)
+            total_pruned_by_egcn += 1
+
+        else:
+            print(f"EGCN判断: 非冗余列 (非冗余概率: {redundancy_info['non_redundant_prob']:.3f})")
+            print("该列被接受，添加到主问题")
+
+            # 将新列添加到主问题
+            beta_pp_expend = np.expand_dims(beta_pp, axis=0)
+            beta_mp = np.concatenate((beta_mp, beta_pp_expend), axis=0)
+
+            tau_pp_expend = np.expand_dims(tau_pp, axis=0)
+            tau_mp = np.concatenate((tau_mp, tau_pp_expend), axis=0)
+
+            c_es_s_Plan_mp[(E_len, s2)] = c_es_PlanPP
+            E_s_dict_mp[s2].append(E_len)
+
+            # 将特征添加到全局特征库
+            all_column_features.append(new_column_features)
+
+            E_len += 1
+            columns_added_this_iter += 1
+
+    iternum += 1
+
+    print(f"\n迭代 {iternum} 总结:")
+    print(f"  - 生成的新列: {S_num}")
+    print(f"  - EGCN剪枝的列: {S_num - columns_added_this_iter}")
+    print(f"  - 添加到主问题的列: {columns_added_this_iter}")
+    print(f"  - 当前总列数: {E_len}")
+
+print("=" * 60)
+print("列生成算法完成")
+print("=" * 60)
+print(f"总计生成列数: {total_generated_columns}")
+print(f"EGCN剪枝列数: {total_pruned_by_egcn}")
+print(f"剪枝率: {total_pruned_by_egcn / total_generated_columns * 100:.1f}%")
+print(f"最终列数: {E_len}")
+print(f"总运行时间: {time.time() - cg_st:.2f} 秒")
+
+total_cons_sn = np.zeros((S_num, N_num))
+for s in S:
+    for n in N:
+        total_cons_sn[s, n] = sum(cons[s, n, t] for t in T)
+
+for s in S:
+    for n in N:
+        if total_cons_sn[s, n] > 0:
+            print("总共从供应商", s, "购买的", n, "种煤炭", total_cons_sn[s, n])
+
+print(f"最终成本: {currobj:.2f}")
+print(f"总运行时间: {time.time() - cg_st:.2f} 秒")
