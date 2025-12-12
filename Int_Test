@@ -94,44 +94,5 @@ for t1 in T:
     m.addConstr(quicksum(tau[s, t, t1] for s in S for t in T) <= b)
 m.optimize()
 
-print(f"结果:{m.objVal}")
-for s in S:
-    for n in N:
-        if alpha[s, n].X > 0:
-            print(f"从供应商{s}购买的{n}种类煤炭{alpha[s, n].X}吨,花费成本{alpha[s, n].X * c_s_n_coal[s, n]}")
-            if n == best_n[s]:
-                print(f"买的自己最好的,{alpha[s, best_n[s]].X / sum(alpha[s, n].X for n in N)}")
-            if alpha[s, n].X >= 0.96 * k_s_n[s, n]:
-                print("全买完了")
-#     if sum(gamma[s, t].x for t in T) >= 1:
-#         print(
-#             f"从供应商{s} 共出发{sum(gamma[s, t].x for t in T)}次运煤船舶，花费成本为{sum(gamma[s, t].x for t in T) * c_s_ship[s]}")
-for s in S:
-    for t in T:
-        for n in N:
-            if gamma[s, t].X > 0.1 and beta[s, n, t].X > 0:
-                print(f"在时刻{t} 从供应商{s}出发的煤炭船舶 装载{n}种类煤炭{beta[s, n, t].X}吨")
-# for t in T:
-#     print(f"1种类煤炭，{t}时刻存优良为{theta[1,t].X}")
-# for s in S:
-#     for t in T:
-#         for t1 in T:
-#             if tau[s, t, t1].X > 0.1:
-#                 print(f"从供应商{s}出发，并且在{t}时刻到达的船舶，在{t1}时刻占用泊位")
-# for n in N:
-#     for t in T:
-#         print(f"在时刻{t}，{n}种类煤炭库存量为{theta[n,t].x}")
-# for t in T:
-#     for s in S:
-#         if sum(beta[s, n, t].X for n in N) > 0.1:
-#             print("在时刻", t, "供应商", s, "供应了总重量",
-#                   quicksum(beta[s, n, t].X for n in N), "热值为",
-#                   quicksum(beta[s, n, t].X * p_n[n] for n in N))
-# print(f"OP原问题operatime: {time.time() - st}")
-total_demand = sum(d_t[t] for t in T)
-for n in N:
-    print(f"{(sum(alpha[s, n].X for s in S) )} ")
-print()
-for s in S:
-    print(f"{(sum(alpha[s, n].X * c_s_n_coal[s,n] for n in N) )}")
+print(f"{m.objVal}")
 print(f"{m.objVal}      {time.time() - st}")
