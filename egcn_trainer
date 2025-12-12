@@ -1,0 +1,1035 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import time
+import os
+from collections import defaultdict
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+from egcn_o import EGCN
+import utils as u
+
+# 尝试导入参数文件，如果不存在则使用默认值
+try:
+    from MT_para_real import *
+except ImportError:
+    print("警告：无法导入MT_para_real.py，使用默认参数")
+    N_num = 5  # 煤炭种类数
+    T_num = 24  # 时间步数
+    S_num = 10  # 供应商数
+
+
+class ColumnDataset(Dataset):
+    """
+    列数据集类，用于训练EGCN
+    """
+
+    def __init__(self, columns_data, labels, max_columns_per_graph=50):
+        """
+        Args:
+            columns_data: 列表，每个元素是一个图的列特征 [(features, adjacency), ...]
+            labels: 列表，每个元素是对应图中每列的标签
+            max_columns_per_graph: 每个图最大列数（用于padding）
+        """
+        self.columns_data = columns_data
+        self.labels = labels
+        self.max_columns = max_columns_per_graph
+
+    def __len__(self):
+        return len(self.columns_data)
+
+    def __getitem__(self, idx):
+        features, adj_matrices = self.columns_data[idx]
+        labels = self.labels[idx]
+
+        # Padding到固定大小
+        n_cols = features.shape[0]
+        if n_cols < self.max_columns:
+            # Padding features
+            pad_features = torch.zeros(self.max_columns - n_cols, features.shape[1])
+            features = torch.cat([features, pad_features], dim=0)
+
+            # Padding adjacency matrices
+            padded_adj = {}
+            for rel_type, adj in adj_matrices.items():
+                pad_adj = torch.zeros(self.max_columns, self.max_columns)
+                pad_adj[:n_cols, :n_cols] = adj
+                padded_adj[rel_type] = pad_adj
+            adj_matrices = padded_adj
+
+            # Padding labels
+            pad_labels = torch.full((self.max_columns - n_cols,), -1, dtype=torch.long)  # -1表示padding
+            labels = torch.cat([labels, pad_labels], dim=0)
+
+        return features, adj_matrices, labels, n_cols
+
+
+class EGCNTrainer:
+    """
+    EGCN训练器
+    """
+
+    def __init__(self, device='cuda', learning_rate=1e-3, weight_decay=1e-5):
+        """
+        Args:
+            device: 计算设备
+            learning_rate: 学习率
+            weight_decay: 权重衰减
+        """
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+
+        # 初始化EGCN模型
+        self.init_model()
+
+        # 损失函数和优化器
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-1)  # 忽略padding标签
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', patience=10, factor=0.5
+        )
+
+        # 训练历史
+        self.train_history = {
+            'loss': [], 'accuracy': [], 'precision': [], 'recall': [], 'f1': []
+        }
+        self.val_history = {
+            'loss': [], 'accuracy': [], 'precision': [], 'recall': [], 'f1': []
+        }
+
+        print(f"EGCN训练器已初始化，使用设备: {self.device}")
+
+    def init_model(self):
+        """初始化EGCN模型"""
+        args = u.Namespace({
+            'feats_per_node': N_num + T_num + 1,  # 特征维度
+            'layer_1_feats': 64,  # 隐藏层维度
+            'layer_2_feats': 32  # 输出嵌入维度
+        })
+
+        self.model = EGCN(args, device=self.device)
+        self.model.to(self.device)
+
+        # 添加分类头
+        self.classifier = nn.Sequential(
+            nn.Linear(args.layer_2_feats, 16),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(16, 2)  # 二分类：0=冗余，1=非冗余
+        ).to(self.device)
+
+        # 将分类器参数添加到优化器
+        all_params = list(self.model.parameters()) + list(self.classifier.parameters())
+        self.optimizer = optim.Adam(all_params, lr=self.learning_rate, weight_decay=self.weight_decay)
+
+    def load_real_cg_column_data(self, data_file='PP+ML/cg_real_column_data.pkl'):
+        """
+        加载基于真实CG列生成过程的训练数据
+
+        Args:
+            data_file: 真实CG列数据文件路径
+
+        Returns:
+            train_dataset, val_dataset 或 None如果加载失败
+        """
+        print("正在加载真实CG列数据...")
+
+        if not os.path.exists(data_file):
+            print(f"❌ 真实CG列数据文件不存在: {data_file}")
+            print("请先运行 cg_column_collector.py 生成真实列数据")
+            return None, None
+
+        try:
+            import pickle
+            with open(data_file, 'rb') as f:
+                cg_data = pickle.load(f)
+
+            print(f"✅ 成功加载真实CG列数据:")
+            print(f"  总列数: {cg_data['statistics']['total_columns']}")
+            print(f"  非冗余列: {cg_data['statistics']['total_accepted']} (标签=1)")
+            print(f"  冗余列: {cg_data['statistics']['total_rejected']} (标签=0)")
+            print(f"  数据来源: {cg_data['statistics']['seeds_processed']} 个随机种子")
+
+            # 转换为EGCN训练格式
+            features = np.array(cg_data['all_features'])
+            labels = np.array(cg_data['all_labels'])
+            suppliers = np.array(cg_data['all_suppliers'])
+            iterations = np.array(cg_data['all_iterations'])
+
+            print(f"  特征维度: {features.shape[1]}")
+
+            # 按迭代分组构建图数据
+            unique_seeds = cg_data['collection_info']['successful_seeds']
+
+            # 为每个种子的每个迭代创建一个图
+            all_graphs = []
+            all_graph_labels = []
+
+            # 按种子和迭代分组
+            seed_iter_groups = {}
+            for i, (supplier, iteration) in enumerate(zip(suppliers, iterations)):
+                # 假设种子信息存储在某处，这里我们简化处理
+                seed_idx = i // 50  # 假设每个种子大约有50列
+                if seed_idx >= len(unique_seeds):
+                    seed_idx = len(unique_seeds) - 1
+
+                key = (unique_seeds[seed_idx], iteration)
+                if key not in seed_iter_groups:
+                    seed_iter_groups[key] = []
+                seed_iter_groups[key].append(i)
+
+            print(f"构建图数据中... (共 {len(seed_iter_groups)} 个图)")
+
+            for (seed, iteration), indices in seed_iter_groups.items():
+                if len(indices) < 2:  # 跳过只有一列的图
+                    continue
+
+                # 提取这个图的特征和标签
+                graph_features = torch.tensor(features[indices], dtype=torch.float32)
+                graph_labels = torch.tensor(labels[indices], dtype=torch.long)
+
+                # 构建邻接矩阵
+                n_nodes = len(indices)
+                adj_matrices = {}
+
+                # 基于特征相似度构建多关系邻接矩阵
+                # 假设特征格式：[coal_quantities(N_num), time_features(T_num), vessel_count(1)]
+                N_num = 5  # 煤炭种类数
+                T_num = 24  # 时间步数
+
+                # 煤炭关系矩阵
+                coal_adj = torch.zeros(n_nodes, n_nodes)
+                # 时间关系矩阵
+                time_adj = torch.zeros(n_nodes, n_nodes)
+                # 船只关系矩阵
+                vessel_adj = torch.zeros(n_nodes, n_nodes)
+
+                for i in range(n_nodes):
+                    for j in range(i + 1, n_nodes):
+                        # 煤炭相似度
+                        coal_feat_i = graph_features[i, :N_num]
+                        coal_feat_j = graph_features[j, :N_num]
+                        coal_sim = 1.0 / (1.0 + torch.norm(coal_feat_i - coal_feat_j).item())
+
+                        # 时间相似度
+                        time_feat_i = graph_features[i, N_num:N_num + T_num]
+                        time_feat_j = graph_features[j, N_num:N_num + T_num]
+                        time_sim = 1.0 / (1.0 + torch.norm(time_feat_i - time_feat_j).item())
+
+                        # 船只相似度
+                        vessel_feat_i = graph_features[i, -1]
+                        vessel_feat_j = graph_features[j, -1]
+                        vessel_sim = 1.0 / (1.0 + abs(vessel_feat_i - vessel_feat_j).item())
+
+                        # 设置边（相似度阈值）
+                        if coal_sim > 0.7:
+                            coal_adj[i, j] = coal_adj[j, i] = 1.0
+                        if time_sim > 0.7:
+                            time_adj[i, j] = time_adj[j, i] = 1.0
+                        if vessel_sim > 0.8:
+                            vessel_adj[i, j] = vessel_adj[j, i] = 1.0
+
+                adj_matrices = {
+                    'coal': coal_adj,
+                    'time': time_adj,
+                    'vessel': vessel_adj
+                }
+
+                all_graphs.append((graph_features, adj_matrices))
+                all_graph_labels.append(graph_labels)
+
+            print(f"✅ 构建了 {len(all_graphs)} 个图")
+
+            # 严格的三分割：训练集(60%) / 验证集(20%) / 测试集(20%)
+            total_graphs = len(all_graphs)
+            train_split_idx = int(0.6 * total_graphs)
+            val_split_idx = int(0.8 * total_graphs)
+
+            # 随机打乱数据以确保分割的随机性
+            indices = np.random.permutation(total_graphs)
+
+            train_indices = indices[:train_split_idx]
+            val_indices = indices[train_split_idx:val_split_idx]
+            test_indices = indices[val_split_idx:]
+
+            train_data = [all_graphs[i] for i in train_indices]
+            train_labels = [all_graph_labels[i] for i in train_indices]
+
+            val_data = [all_graphs[i] for i in val_indices]
+            val_labels = [all_graph_labels[i] for i in val_indices]
+
+            test_data = [all_graphs[i] for i in test_indices]
+            test_labels = [all_graph_labels[i] for i in test_indices]
+
+            train_dataset = ColumnDataset(train_data, train_labels)
+            val_dataset = ColumnDataset(val_data, val_labels)
+            test_dataset = ColumnDataset(test_data, test_labels)
+
+            print(f"严格数据分割完成：")
+            print(f"  训练集: {len(train_dataset)} 个图 ({len(train_dataset) / total_graphs:.1%})")
+            print(f"  验证集: {len(val_dataset)} 个图 ({len(val_dataset) / total_graphs:.1%})")
+            print(f"  测试集: {len(test_dataset)} 个图 ({len(test_dataset) / total_graphs:.1%})")
+
+            return train_dataset, val_dataset, test_dataset
+
+        except Exception as e:
+            print(f"❌ 加载真实CG列数据失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None, None
+
+    def generate_training_data(self, num_graphs=1000, columns_per_graph_range=(10, 50)):
+        """
+        生成训练数据（模拟数据，作为备选方案）
+
+        Args:
+            num_graphs: 生成的图数量
+            columns_per_graph_range: 每个图的列数范围
+
+        Returns:
+            train_dataset, val_dataset
+        """
+        print("正在生成模拟训练数据...")
+
+        all_columns_data = []
+        all_labels = []
+
+        for graph_idx in range(num_graphs):
+            if graph_idx % 100 == 0:
+                print(f"生成进度: {graph_idx}/{num_graphs}")
+
+            # 随机确定这个图的列数
+            n_columns = np.random.randint(*columns_per_graph_range)
+
+            # 生成列特征
+            features = self.generate_column_features(n_columns)
+
+            # 生成邻接矩阵
+            adj_matrices = self.generate_adjacency_matrices(features)
+
+            # 生成标签（基于相似度的启发式规则）
+            labels = self.generate_labels(features)
+
+            all_columns_data.append((features, adj_matrices))
+            all_labels.append(labels)
+
+        # 严格的三分割：训练集(60%) / 验证集(20%) / 测试集(20%)
+        train_split_idx = int(0.6 * num_graphs)
+        val_split_idx = int(0.8 * num_graphs)
+
+        # 随机打乱数据
+        indices = np.random.permutation(num_graphs)
+
+        train_indices = indices[:train_split_idx]
+        val_indices = indices[train_split_idx:val_split_idx]
+        test_indices = indices[val_split_idx:]
+
+        train_data = [all_columns_data[i] for i in train_indices]
+        train_labels = [all_labels[i] for i in train_indices]
+
+        val_data = [all_columns_data[i] for i in val_indices]
+        val_labels = [all_labels[i] for i in val_indices]
+
+        test_data = [all_columns_data[i] for i in test_indices]
+        test_labels = [all_labels[i] for i in test_indices]
+
+        train_dataset = ColumnDataset(train_data, train_labels)
+        val_dataset = ColumnDataset(val_data, val_labels)
+        test_dataset = ColumnDataset(test_data, test_labels)
+
+        print(f"模拟训练数据生成完成：")
+        print(f"  训练集: {len(train_dataset)} 个图 ({len(train_dataset) / num_graphs:.1%})")
+        print(f"  验证集: {len(val_dataset)} 个图 ({len(val_dataset) / num_graphs:.1%})")
+        print(f"  测试集: {len(test_dataset)} 个图 ({len(test_dataset) / num_graphs:.1%})")
+
+        return train_dataset, val_dataset, test_dataset
+
+    def generate_column_features(self, n_columns):
+        """
+        生成列特征矩阵
+
+        Args:
+            n_columns: 列数
+
+        Returns:
+            features: (n_columns, feature_dim) 特征矩阵
+        """
+        feature_dim = N_num + T_num + 1
+        features = torch.zeros(n_columns, feature_dim)
+
+        for i in range(n_columns):
+            # 煤炭数量特征（前N_num维）
+            coal_features = torch.rand(N_num) * 100  # 0-100的随机采购量
+
+            # 时间特征（中间T_num维）
+            time_features = torch.rand(T_num) * 5  # 0-5的随机泊位占用
+
+            # 船只特征（最后1维）
+            vessel_feature = torch.randint(1, 6, (1,)).float()  # 1-5艘船
+
+            features[i] = torch.cat([coal_features, time_features, vessel_feature])
+
+        return features
+
+    def generate_adjacency_matrices(self, features):
+        """
+        生成邻接矩阵
+
+        Args:
+            features: 特征矩阵
+
+        Returns:
+            adj_matrices: 邻接矩阵字典
+        """
+        n_columns = features.shape[0]
+        relation_types = ['coal', 'time', 'vessel']
+        adj_matrices = {}
+
+        for rel_type in relation_types:
+            adj = torch.zeros(n_columns, n_columns)
+
+            for i in range(n_columns):
+                for j in range(i + 1, n_columns):
+                    # 计算相似度
+                    if rel_type == 'coal':
+                        sim = self.calculate_similarity(
+                            features[i, :N_num], features[j, :N_num]
+                        )
+                    elif rel_type == 'time':
+                        sim = self.calculate_similarity(
+                            features[i, N_num:N_num + T_num], features[j, N_num:N_num + T_num]
+                        )
+                    else:  # vessel
+                        sim = 1.0 / (1.0 + abs(features[i, -1] - features[j, -1]))
+
+                    # 如果相似度超过阈值，创建边
+                    if sim > 0.8:
+                        adj[i, j] = adj[j, i] = 1.0
+
+            # 归一化
+            degree = adj.sum(dim=1)
+            degree[degree == 0] = 1  # 避免除零
+            D_inv_sqrt = torch.diag(torch.pow(degree, -0.5))
+            adj = torch.mm(torch.mm(D_inv_sqrt, adj), D_inv_sqrt)
+
+            adj_matrices[rel_type] = adj
+
+        return adj_matrices
+
+    def calculate_similarity(self, vec1, vec2):
+        """计算两个向量的相似度"""
+        distance = torch.norm(vec1 - vec2).item()
+        return 1.0 / (1.0 + distance)
+
+    def generate_labels(self, features):
+        """
+        基于启发式规则生成标签
+
+        Args:
+            features: 特征矩阵
+
+        Returns:
+            labels: 标签向量（0=冗余，1=非冗余）
+        """
+        n_columns = features.shape[0]
+        labels = torch.ones(n_columns, dtype=torch.long)  # 默认为非冗余
+
+        # 找到高度相似的列对
+        for i in range(n_columns):
+            for j in range(i + 1, n_columns):
+                # 计算总体相似度
+                coal_sim = self.calculate_similarity(
+                    features[i, :N_num], features[j, :N_num]
+                )
+                time_sim = self.calculate_similarity(
+                    features[i, N_num:N_num + T_num], features[j, N_num:N_num + T_num]
+                )
+                vessel_sim = 1.0 / (1.0 + abs(features[i, -1] - features[j, -1]))
+
+                avg_sim = (coal_sim + time_sim + vessel_sim) / 3.0
+
+                # 如果相似度很高，标记较晚生成的列为冗余
+                if avg_sim > 0.95:
+                    labels[j] = 0  # 冗余
+
+        return labels
+
+    def train_epoch(self, train_loader):
+        """训练一个epoch"""
+        self.model.train()
+        self.classifier.train()
+
+        total_loss = 0
+        all_predictions = []
+        all_labels = []
+
+        for batch_idx, (features, adj_matrices, labels, n_cols_list) in enumerate(train_loader):
+            features = features.to(self.device)
+            labels = labels.to(self.device)
+
+            # 将邻接矩阵移到设备上
+            adj_matrices_device = {}
+            for rel_type in adj_matrices:
+                adj_matrices_device[rel_type] = adj_matrices[rel_type].to(self.device)
+
+            self.optimizer.zero_grad()
+
+            batch_loss = 0
+            batch_predictions = []
+            batch_true_labels = []
+
+            # 对batch中的每个图分别处理
+            for i in range(features.shape[0]):
+                n_cols = n_cols_list[i].item()
+                if n_cols <= 1:  # 跳过只有一列或没有列的图
+                    continue
+
+                # 提取当前图的数据
+                graph_features = features[i, :n_cols]
+                graph_labels = labels[i, :n_cols]
+                graph_adj = {
+                    rel_type: adj_matrices_device[rel_type][i, :n_cols, :n_cols]
+                    for rel_type in adj_matrices_device
+                }
+
+                # 模拟新列的聚合特征
+                X_new = torch.mean(graph_features, dim=0)
+
+                # EGCN前向传播
+                node_embeddings, _ = self.model.forward(
+                    node_features=graph_features,
+                    X_new=X_new,
+                    existing_embeddings=None,
+                    update_weights=True
+                )
+
+                # 分类
+                logits = self.classifier(node_embeddings)
+
+                # 计算损失
+                loss = self.criterion(logits, graph_labels)
+                batch_loss += loss
+
+                # 收集预测和真实标签
+                with torch.no_grad():
+                    predictions = torch.argmax(logits, dim=1)
+                    batch_predictions.extend(predictions.cpu().numpy())
+                    batch_true_labels.extend(graph_labels.cpu().numpy())
+
+            if batch_loss > 0:
+                batch_loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.model.parameters()) + list(self.classifier.parameters()),
+                    max_norm=1.0
+                )
+                self.optimizer.step()
+
+                total_loss += batch_loss.item()
+                all_predictions.extend(batch_predictions)
+                all_labels.extend(batch_true_labels)
+
+        # 计算指标
+        if len(all_predictions) > 0:
+            accuracy = accuracy_score(all_labels, all_predictions)
+            precision = precision_score(all_labels, all_predictions, average='weighted', zero_division=0)
+            recall = recall_score(all_labels, all_predictions, average='weighted', zero_division=0)
+            f1 = f1_score(all_labels, all_predictions, average='weighted', zero_division=0)
+        else:
+            accuracy = precision = recall = f1 = 0.0
+
+        avg_loss = total_loss / len(train_loader) if len(train_loader) > 0 else 0.0
+
+        return avg_loss, accuracy, precision, recall, f1
+
+    def validate_epoch(self, val_loader):
+        """验证一个epoch"""
+        self.model.eval()
+        self.classifier.eval()
+
+        total_loss = 0
+        all_predictions = []
+        all_labels = []
+
+        with torch.no_grad():
+            for features, adj_matrices, labels, n_cols_list in val_loader:
+                features = features.to(self.device)
+                labels = labels.to(self.device)
+
+                adj_matrices_device = {}
+                for rel_type in adj_matrices:
+                    adj_matrices_device[rel_type] = adj_matrices[rel_type].to(self.device)
+
+                batch_loss = 0
+                batch_predictions = []
+                batch_true_labels = []
+
+                for i in range(features.shape[0]):
+                    n_cols = n_cols_list[i].item()
+                    if n_cols <= 1:
+                        continue
+
+                    graph_features = features[i, :n_cols]
+                    graph_labels = labels[i, :n_cols]
+                    graph_adj = {
+                        rel_type: adj_matrices_device[rel_type][i, :n_cols, :n_cols]
+                        for rel_type in adj_matrices_device
+                    }
+
+                    X_new = torch.mean(graph_features, dim=0)
+
+                    node_embeddings, _ = self.model.forward(
+                        node_features=graph_features,
+                        X_new=X_new,
+                        existing_embeddings=None,
+                        update_weights=True
+                    )
+
+                    logits = self.classifier(node_embeddings)
+                    loss = self.criterion(logits, graph_labels)
+                    batch_loss += loss
+
+                    predictions = torch.argmax(logits, dim=1)
+                    batch_predictions.extend(predictions.cpu().numpy())
+                    batch_true_labels.extend(graph_labels.cpu().numpy())
+
+                total_loss += batch_loss.item()
+                all_predictions.extend(batch_predictions)
+                all_labels.extend(batch_true_labels)
+
+        if len(all_predictions) > 0:
+            accuracy = accuracy_score(all_labels, all_predictions)
+            precision = precision_score(all_labels, all_predictions, average='weighted', zero_division=0)
+            recall = recall_score(all_labels, all_predictions, average='weighted', zero_division=0)
+            f1 = f1_score(all_labels, all_predictions, average='weighted', zero_division=0)
+        else:
+            accuracy = precision = recall = f1 = 0.0
+
+        avg_loss = total_loss / len(val_loader) if len(val_loader) > 0 else 0.0
+
+        return avg_loss, accuracy, precision, recall, f1
+
+    def final_test_evaluation(self, test_dataset, model_path=None):
+        """
+        在独立测试集上进行最终评估（严格验证）
+
+        Args:
+            test_dataset: 独立的测试数据集
+            model_path: 训练好的模型路径（可选，用于加载最佳模型）
+
+        Returns:
+            test_results: 详细的测试结果
+        """
+        print("=" * 60)
+        print("🔬 开始在独立测试集上进行最终评估")
+        print("=" * 60)
+
+        # 如果提供了模型路径，加载最佳模型
+        if model_path and os.path.exists(model_path):
+            print(f"📂 加载最佳模型: {model_path}")
+            checkpoint = torch.load(model_path, map_location=self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.classifier.load_state_dict(checkpoint['classifier_state_dict'])
+            print(f"✅ 模型加载完成（训练轮次: {checkpoint.get('epoch', 'unknown')}）")
+
+        self.model.eval()
+        self.classifier.eval()
+
+        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
+
+        all_predictions = []
+        all_probabilities = []
+        all_true_labels = []
+        all_losses = []
+
+        print(f"📊 测试集规模: {len(test_dataset)} 个图")
+
+        with torch.no_grad():
+            for batch_idx, (features, adj_matrices, labels) in enumerate(test_loader):
+                if batch_idx % 10 == 0:
+                    print(f"  处理进度: {batch_idx + 1}/{len(test_loader)}")
+
+                features = features.to(self.device)
+                labels = labels.to(self.device)
+
+                # 转换邻接矩阵
+                adj_dict = {}
+                for relation in ['coal', 'time', 'vessel']:
+                    adj_dict[relation] = adj_matrices[relation].to(self.device)
+
+                try:
+                    # 前向传播
+                    node_embeddings, _ = self.model(adj_dict, features)
+                    logits = self.classifier(node_embeddings)
+
+                    # 计算损失
+                    loss = F.cross_entropy(logits, labels)
+                    all_losses.append(loss.item())
+
+                    # 获取预测
+                    probabilities = F.softmax(logits, dim=1)
+                    predictions = torch.argmax(probabilities, dim=1)
+
+                    all_predictions.extend(predictions.cpu().numpy())
+                    all_probabilities.extend(probabilities.cpu().numpy())
+                    all_true_labels.extend(labels.cpu().numpy())
+
+                except Exception as e:
+                    print(f"⚠️ 批次 {batch_idx} 处理失败: {e}")
+                    continue
+
+        # 计算详细评估指标
+        all_predictions = np.array(all_predictions)
+        all_probabilities = np.array(all_probabilities)
+        all_true_labels = np.array(all_true_labels)
+
+        # 基本指标
+        test_loss = np.mean(all_losses)
+        accuracy = accuracy_score(all_true_labels, all_predictions)
+        precision = precision_score(all_true_labels, all_predictions, average='weighted', zero_division=0)
+        recall = recall_score(all_true_labels, all_predictions, average='weighted', zero_division=0)
+        f1 = f1_score(all_true_labels, all_predictions, average='weighted', zero_division=0)
+
+        # 混淆矩阵
+        from sklearn.metrics import confusion_matrix, classification_report
+        cm = confusion_matrix(all_true_labels, all_predictions)
+
+        # AUC-ROC（如果是二分类）
+        auc_roc = None
+        if len(np.unique(all_true_labels)) == 2:
+            from sklearn.metrics import roc_auc_score
+            auc_roc = roc_auc_score(all_true_labels, all_probabilities[:, 1])
+
+        # 按类别统计
+        unique_labels = np.unique(all_true_labels)
+        class_stats = {}
+        for label in unique_labels:
+            mask = all_true_labels == label
+            class_stats[label] = {
+                'count': np.sum(mask),
+                'accuracy': np.sum(all_predictions[mask] == label) / np.sum(mask),
+                'avg_confidence': np.mean(np.max(all_probabilities[mask], axis=1))
+            }
+
+        # 整理测试结果
+        test_results = {
+            'test_loss': test_loss,
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1_score': f1,
+            'auc_roc': auc_roc,
+            'confusion_matrix': cm,
+            'class_statistics': class_stats,
+            'num_samples': len(all_true_labels),
+            'predictions': all_predictions,
+            'probabilities': all_probabilities,
+            'true_labels': all_true_labels
+        }
+
+        # 打印详细结果
+        print("\\n📋 最终测试结果（独立测试集）")
+        print("=" * 50)
+        print(f"测试损失:     {test_loss:.4f}")
+        print(f"准确率:       {accuracy:.4f} ({accuracy * 100:.2f}%)")
+        print(f"精确率:       {precision:.4f}")
+        print(f"召回率:       {recall:.4f}")
+        print(f"F1分数:       {f1:.4f}")
+        if auc_roc:
+            print(f"AUC-ROC:      {auc_roc:.4f}")
+
+        print(f"\\n📊 混淆矩阵:")
+        print("    预测")
+        print("      0    1")
+        print(f"真 0 {cm[0, 0]:4d} {cm[0, 1]:4d}")
+        print(f"实 1 {cm[1, 0]:4d} {cm[1, 1]:4d}")
+
+        print(f"\\n🔍 按类别统计:")
+        for label, stats in class_stats.items():
+            label_name = "冗余列" if label == 0 else "非冗余列"
+            print(f"  {label_name} (标签={label}):")
+            print(f"    样本数: {stats['count']}")
+            print(f"    准确率: {stats['accuracy']:.4f}")
+            print(f"    平均置信度: {stats['avg_confidence']:.4f}")
+
+        # 保存详细结果
+        results_file = f"PP+ML/final_test_results_{int(time.time())}.pkl"
+        import pickle
+        with open(results_file, 'wb') as f:
+            pickle.dump(test_results, f)
+
+        print(f"\\n💾 详细结果已保存到: {results_file}")
+
+        # 生成分类报告
+        print(f"\\n📈 详细分类报告:")
+        target_names = ['冗余列', '非冗余列']
+        print(classification_report(all_true_labels, all_predictions, target_names=target_names))
+
+        return test_results
+
+    def train(self, num_epochs=100, batch_size=16, save_path='egcn_model.pth', use_real_data=True):
+        """
+        完整的训练流程
+
+        Args:
+            num_epochs: 训练轮数
+            batch_size: 批大小
+            save_path: 模型保存路径
+            use_real_data: 是否使用真实CG数据
+        """
+        print("=" * 60)
+        print("开始EGCN模型训练")
+        print("=" * 60)
+
+        # 优先尝试加载真实CG列数据
+        if use_real_data:
+            train_dataset, val_dataset, test_dataset = self.load_real_cg_column_data()
+            if train_dataset is None:
+                print("⚠️ 真实CG列数据加载失败，回退到模拟数据")
+                train_dataset, val_dataset, test_dataset = self.generate_training_data()
+        else:
+            train_dataset, val_dataset, test_dataset = self.generate_training_data()
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True, num_workers=0
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False, num_workers=0
+        )
+
+        best_val_f1 = 0.0
+        patience_counter = 0
+        patience = 20
+
+        print(f"训练参数:")
+        print(f"  - 训练轮数: {num_epochs}")
+        print(f"  - 批大小: {batch_size}")
+        print(f"  - 学习率: {self.learning_rate}")
+        print(f"  - 设备: {self.device}")
+        print()
+
+        for epoch in range(num_epochs):
+            start_time = time.time()
+
+            # 训练
+            train_loss, train_acc, train_prec, train_rec, train_f1 = self.train_epoch(train_loader)
+
+            # 验证
+            val_loss, val_acc, val_prec, val_rec, val_f1 = self.validate_epoch(val_loader)
+
+            # 学习率调度
+            self.scheduler.step(val_loss)
+
+            # 记录历史
+            self.train_history['loss'].append(train_loss)
+            self.train_history['accuracy'].append(train_acc)
+            self.train_history['precision'].append(train_prec)
+            self.train_history['recall'].append(train_rec)
+            self.train_history['f1'].append(train_f1)
+
+            self.val_history['loss'].append(val_loss)
+            self.val_history['accuracy'].append(val_acc)
+            self.val_history['precision'].append(val_prec)
+            self.val_history['recall'].append(val_rec)
+            self.val_history['f1'].append(val_f1)
+
+            epoch_time = time.time() - start_time
+
+            # 打印进度
+            if epoch % 5 == 0 or epoch == num_epochs - 1:
+                print(f"Epoch [{epoch + 1}/{num_epochs}] ({epoch_time:.2f}s)")
+                print(f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.4f}, F1={train_f1:.4f}")
+                print(f"  Val:   Loss={val_loss:.4f}, Acc={val_acc:.4f}, F1={val_f1:.4f}")
+                print(f"  LR: {self.optimizer.param_groups[0]['lr']:.6f}")
+                print()
+
+            # 早停和模型保存
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                patience_counter = 0
+
+                # 保存最佳模型
+                torch.save({
+                    'model_state_dict': self.model.state_dict(),
+                    'classifier_state_dict': self.classifier.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'epoch': epoch,
+                    'best_val_f1': best_val_f1,
+                    'train_history': self.train_history,
+                    'val_history': self.val_history
+                }, save_path)
+
+                print(f"  ✅ 新的最佳模型已保存 (Val F1: {best_val_f1:.4f})")
+            else:
+                patience_counter += 1
+
+            # 早停检查
+            if patience_counter >= patience:
+                print(f"\n早停触发！验证F1已经{patience}轮没有改善")
+                break
+
+        print("=" * 60)
+        print("训练完成！")
+        print(f"最佳验证F1: {best_val_f1:.4f}")
+        print(f"模型已保存到: {save_path}")
+        print("=" * 60)
+
+        # 绘制训练曲线
+        self.plot_training_curves()
+
+        # 🔬 严格验证：在独立测试集上进行最终评估
+        print("\\n" + "=" * 60)
+        print("🔬 开始严格验证：独立测试集评估")
+        print("=" * 60)
+
+        # 确保使用最佳模型进行测试
+        test_results = self.final_test_evaluation(test_dataset, save_path)
+
+        print("\\n🎯 严格验证完成！")
+
+        return test_results
+
+    def plot_training_curves(self):
+        """绘制训练曲线"""
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+        # Loss曲线
+        axes[0, 0].plot(self.train_history['loss'], label='Train Loss')
+        axes[0, 0].plot(self.val_history['loss'], label='Val Loss')
+        axes[0, 0].set_title('Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True)
+
+        # Accuracy曲线
+        axes[0, 1].plot(self.train_history['accuracy'], label='Train Acc')
+        axes[0, 1].plot(self.val_history['accuracy'], label='Val Acc')
+        axes[0, 1].set_title('Accuracy')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True)
+
+        # Precision曲线
+        axes[1, 0].plot(self.train_history['precision'], label='Train Prec')
+        axes[1, 0].plot(self.val_history['precision'], label='Val Prec')
+        axes[1, 0].set_title('Precision')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True)
+
+        # F1曲线
+        axes[1, 1].plot(self.train_history['f1'], label='Train F1')
+        axes[1, 1].plot(self.val_history['f1'], label='Val F1')
+        axes[1, 1].set_title('F1 Score')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True)
+
+        plt.tight_layout()
+        plt.savefig('PP+ML/egcn_training_curves.png', dpi=300, bbox_inches='tight')
+        plt.show()
+        print("训练曲线已保存到: PP+ML/egcn_training_curves.png")
+
+    def load_model(self, model_path):
+        """加载训练好的模型"""
+        checkpoint = torch.load(model_path, map_location=self.device)
+
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.classifier.load_state_dict(checkpoint['classifier_state_dict'])
+
+        if 'train_history' in checkpoint:
+            self.train_history = checkpoint['train_history']
+            self.val_history = checkpoint['val_history']
+
+        print(f"模型已从 {} 加载完成")
+        print(f"最佳验证F1: {checkpoint.get('best_val_f1', 'N/A')}")
+
+    def evaluate_on_real_data(self, columns_features, similarity_threshold=0.95):
+        """
+        在真实数据上评估模型
+
+        Args:
+            columns_features: 真实的列特征列表
+            similarity_threshold: 相似度阈值
+
+        Returns:
+            predictions, probabilities
+        """
+        self.model.eval()
+        self.classifier.eval()
+
+        if len(columns_features) <= 1:
+            return [], []
+
+        with torch.no_grad():
+            # 转换为张量
+            features = torch.tensor(np.array(columns_features), dtype=torch.float32, device=self.device)
+
+            # 构建邻接矩阵
+            adj_matrices = self.generate_adjacency_matrices(features)
+            for rel_type in adj_matrices:
+                adj_matrices[rel_type] = adj_matrices[rel_type].to(self.device)
+
+            # 计算聚合特征
+            X_new = torch.mean(features, dim=0)
+
+            # EGCN前向传播
+            node_embeddings, _ = self.model.forward(
+                node_features=features,
+                X_new=X_new,
+                existing_embeddings=None,
+                update_weights=True
+            )
+
+            # 分类
+            logits = self.classifier(node_embeddings)
+            probabilities = F.softmax(logits, dim=1)
+            predictions = torch.argmax(logits, dim=1)
+
+            return predictions.cpu().numpy(), probabilities.cpu().numpy()
+
+
+def main():
+    """训练EGCN模型的主函数"""
+    # 设置随机种子
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    # 创建训练器
+    trainer = EGCNTrainer(
+        device='cuda',
+        learning_rate=1e-3,
+        weight_decay=1e-5
+    )
+
+    # 开始训练
+    trainer.train(
+        num_epochs=100,
+        batch_size=8,
+        save_path='PP+ML/egcn_trained_model.pth'
+    )
+
+    # 测试模型
+    print("\n测试训练好的模型...")
+
+    # 生成一些测试数据
+    test_features = [
+        np.random.rand(N_num + T_num + 1) for _ in range(10)
+    ]
+
+    predictions, probabilities = trainer.evaluate_on_real_data(test_features)
+
+    print("测试结果:")
+    for i, (pred, prob) in enumerate(zip(predictions, probabilities)):
+        redundant_prob = prob[0]
+        non_redundant_prob = prob[1]
+        print(f"列 {i}: {'冗余' if pred == 0 else '非冗余'} "
+              f"(冗余概率: {redundant_prob:.3f}, 非冗余概率: {non_redundant_prob:.3f})")
+
+
+if __name__ == "__main__":
+    main()
